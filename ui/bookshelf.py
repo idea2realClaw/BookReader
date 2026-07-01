@@ -79,6 +79,8 @@ class BookShelf(ft.View):
             })
         except Exception as ex:
             print(f"添加书籍失败: {path}, {ex}")
+            import traceback
+            traceback.print_exc()
 
     def _refresh_grid(self):
         self.grid.controls.clear()
@@ -121,13 +123,38 @@ class BookShelf(ft.View):
         self.ft_page.update()
 
     async def _open_book(self, path: str):
-        reader = open_book(path)
-        reader.load()
-        viewer = BookViewer(reader, self.ft_page, on_close=self._back_to_shelf)
-        self.ft_page.views.clear()
-        self.ft_page.views.append(self)
-        self.ft_page.views.append(ft.View(route="/read", controls=[viewer]))
-        await self.ft_page.push_route("/read")
+        print(f"[BookShelf] Opening book: {path}")
+        try:
+            reader = open_book(path)
+            print(f"[BookShelf] Reader created: {type(reader).__name__}")
+            
+            reader.load()
+            print(f"[BookShelf] Reader loaded successfully")
+            print(f"[BookShelf] Title: {reader.metadata.title}")
+            print(f"[BookShelf] Pages: {reader.get_page_count()}")
+            
+            viewer = BookViewer(reader, self.ft_page, on_close=self._back_to_shelf)
+            print(f"[BookShelf] BookViewer created")
+            
+            self.ft_page.views.clear()
+            self.ft_page.views.append(self)
+            self.ft_page.views.append(ft.View(route="/read", controls=[viewer]))
+            print(f"[BookShelf] Views updated, pushing route...")
+            
+            await self.ft_page.push_route("/read")
+            print(f"[BookShelf] Route pushed successfully")
+            
+        except Exception as e:
+            print(f"[BookShelf] ERROR opening book: {e}")
+            import traceback
+            traceback.print_exc()
+            # Show error to user
+            self.ft_page.snack_bar = ft.SnackBar(
+                content=ft.Text(f"打开书籍失败: {e}"),
+                action="OK"
+            )
+            self.ft_page.snack_bar.open = True
+            self.ft_page.update()
 
     async def _back_to_shelf(self):
         self.ft_page.views.pop()
