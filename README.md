@@ -33,18 +33,35 @@ BookReader/
 
 ## 本地运行
 
-### Windows (PowerShell)
+BookReader 支持两种运行模式：
 
+### 1. 浏览器模式（推荐，默认）
+
+应用在默认浏览器中打开，避免 Windows WebView2 问题。
+
+**Windows (PowerShell):**
 ```powershell
 cd D:\DiskD\GitHub\BookReader
 .venv\Scripts\python.exe main.py
 ```
 
-或使用启动脚本：
-
+**或使用启动脚本：**
 ```powershell
 cd D:\DiskD\GitHub\BookReader
 .\run.bat
+```
+
+**自定义端口：**
+```powershell
+.venv\Scripts\python.exe main.py --mode browser --port 8080
+```
+
+### 2. 桌面模式
+
+应用作为原生桌面窗口打开（需要系统安装 WebView2 运行时）。
+
+```powershell
+.venv\Scripts\python.exe main.py --mode desktop
 ```
 
 ### Linux/Mac
