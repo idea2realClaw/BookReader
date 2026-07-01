@@ -33,24 +33,35 @@ BookReader/
 
 ## 本地运行
 
-### 快速启动（推荐）
+### Windows (PowerShell)
 
-**Windows:**
-```bash
-run.bat
+```powershell
+cd D:\DiskD\GitHub\BookReader
+.venv\Scripts\python.exe main.py
 ```
 
-**Linux/Mac:**
-```bash
-./run.sh
+或使用启动脚本：
+
+```powershell
+cd D:\DiskD\GitHub\BookReader
+.\run.bat
 ```
 
-### 手动启动
+### Linux/Mac
 
 ```bash
+cd /path/to/BookReader
+.venv/bin/python main.py
+```
+
+### 手动安装依赖
+
+如果 .venv 不存在，先创建虚拟环境：
+
+```bash
+cd D:\DiskD\GitHub\BookReader
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe main.py
 ```
 
 ## 运行测试

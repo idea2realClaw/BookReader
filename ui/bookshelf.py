@@ -108,7 +108,7 @@ class BookShelf(ft.View):
                                 color=ft.Colors.BLACK38,
                             ),
                         ],
-                        alignment=ft.MainAxisAlignment.center,
+                        alignment=ft.MainAxisAlignment.CENTER,
                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                     padding=10,
