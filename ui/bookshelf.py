@@ -55,6 +55,7 @@ class BookShelf(ft.View):
                 allow_multiple=True,
                 file_type=ft.FilePickerFileType.CUSTOM,
                 allowed_extensions=["txt", "epub", "pdf"],
+                with_data=True,  # Important: Get file content in browser mode
             )
             print(f"[BookShelf] FilePicker result: {files}")
             
