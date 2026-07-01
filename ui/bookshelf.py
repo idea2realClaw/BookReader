@@ -47,22 +47,47 @@ class BookShelf(ft.View):
         ]
 
     async def _pick_file(self, e):
-        files = await ft.FilePicker().pick_files(
-            allow_multiple=True,
-            file_type=ft.FilePickerFileType.CUSTOM,
-            allowed_extensions=["txt", "epub", "pdf"],
-        )
-        self._process_picked_files(files or [])
+        print(f"[BookShelf] FilePicker opened")
+        try:
+            files = await ft.FilePicker().pick_files(
+                allow_multiple=True,
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["txt", "epub", "pdf"],
+            )
+            print(f"[BookShelf] FilePicker result: {files}")
+            print(f"[BookShelf] Files type: {type(files)}")
+            if files:
+                print(f"[BookShelf] Number of files selected: {len(files)}")
+                for f in files:
+                    print(f"[BookShelf] File: {f.path if hasattr(f, 'path') else f}")
+            self._process_picked_files(files or [])
+        except Exception as ex:
+            print(f"[BookShelf] FilePicker ERROR: {ex}")
+            import traceback
+            traceback.print_exc()
 
     def _process_picked_files(self, files):
+        print(f"[BookShelf] _process_picked_files called with {len(files) if files else 0} files")
+        if not files:
+            print("[BookShelf] No files to process")
+            return
+        
         for f in files:
-            path = f.path
+            print(f"[BookShelf] Processing file: {f}")
+            path = f.path if hasattr(f, 'path') else str(f)
+            print(f"[BookShelf] File path: {path}")
             if not path:
+                print("[BookShelf] Empty path, skipping")
                 continue
             lower = path.lower()
             if lower.endswith((".txt", ".epub", ".pdf")):
+                print(f"[BookShelf] Valid file type, adding to shelf: {path}")
                 self._add_book(path)
+            else:
+                print(f"[BookShelf] Invalid file type: {path}")
+        print("[BookShelf] Refreshing grid...")
         self._refresh_grid()
+        print("[BookShelf] Grid refreshed")
 
 
     def _add_book(self, path: str):
@@ -115,7 +140,7 @@ class BookShelf(ft.View):
                     ),
                     padding=10,
                     alignment=ft.Alignment.CENTER,
-                    on_click=lambda e, p=book["path"]: self._open_book(p),
+                    on_click=lambda e, p=book["path"]: self.ft_page.run(self._open_book, p),
                 ),
                 elevation=4,
             )
