@@ -1,5 +1,6 @@
 import os
 import tempfile
+import asyncio
 import flet as ft
 from reader import open_book
 from ui.book_viewer import BookViewer
@@ -171,7 +172,7 @@ class BookShelf(ft.View):
                     ),
                     padding=10,
                     alignment=ft.Alignment.CENTER,
-                    on_click=lambda e, p=book["path"]: self.ft_page.run(self._open_book, p),
+                    on_click=lambda e, p=book["path"]: asyncio.create_task(self._open_book(p)),
                 ),
                 elevation=4,
             )
