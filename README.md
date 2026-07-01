@@ -33,6 +33,20 @@ BookReader/
 
 ## 本地运行
 
+### 快速启动（推荐）
+
+**Windows:**
+```bash
+run.bat
+```
+
+**Linux/Mac:**
+```bash
+./run.sh
+```
+
+### 手动启动
+
 ```bash
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
