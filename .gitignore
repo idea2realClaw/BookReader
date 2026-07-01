@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+bin/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib64/
+__pypackages__/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# WorkBuddy
+.workbuddy/
+
+# Assets - sample files (keep directory but ignore generated samples)
+assets/sample.txt
+assets/sample.pdf
+assets/sample.epub
+assets/make_sample_pdf.py
+assets/make_sample_epub.py
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Flet build artifacts
+build/
+android/
+ios/
+web/
+macos/
+windows/
+linux/
+
+# Temp files
+tmp_*/
+*.log
