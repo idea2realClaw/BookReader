@@ -1,4 +1,5 @@
 import os
+import tempfile
 import flet as ft
 from reader import open_book
 from ui.book_viewer import BookViewer
@@ -10,7 +11,8 @@ class BookShelf(ft.View):
     def __init__(self, page: ft.Page):
         super().__init__(route="/")
         self.ft_page = page
-        self.books = []
+        self.books = []  # List of dicts: {path, title, author, pages}
+        self._temp_files = []  # Track temp files for cleanup
         self._build()
 
     def _build(self):
@@ -55,12 +57,37 @@ class BookShelf(ft.View):
                 allowed_extensions=["txt", "epub", "pdf"],
             )
             print(f"[BookShelf] FilePicker result: {files}")
-            print(f"[BookShelf] Files type: {type(files)}")
-            if files:
-                print(f"[BookShelf] Number of files selected: {len(files)}")
-                for f in files:
-                    print(f"[BookShelf] File: {f.path if hasattr(f, 'path') else f}")
-            self._process_picked_files(files or [])
+            
+            if not files:
+                print("[BookShelf] No files selected")
+                return
+            
+            # Process files - handle both desktop (path) and web/browser mode (bytes)
+            for f in files:
+                print(f"[BookShelf] Processing: {f.name} (path={f.path}, has_bytes={f.bytes is not None})")
+                
+                if f.path:  # Desktop mode - direct file path
+                    print(f"[BookShelf] Desktop mode: using path {f.path}")
+                    self._add_book(f.path)
+                elif f.bytes:  # Browser mode - save to temp file
+                    print(f"[BookShelf] Browser mode: saving {f.name} to temp file")
+                    temp_dir = os.path.join(os.path.dirname(__file__), "..", "temp")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    temp_path = os.path.join(temp_dir, f.name)
+                    
+                    with open(temp_path, "wb") as fp:
+                        fp.write(f.bytes)
+                    
+                    print(f"[BookShelf] Saved to: {temp_path}")
+                    self._temp_files.append(temp_path)
+                    self._add_book(temp_path)
+                else:
+                    print(f"[BookShelf] ERROR: File {f.name} has no path and no bytes")
+            
+            print("[BookShelf] Refreshing grid...")
+            self._refresh_grid()
+            print("[BookShelf] Grid refreshed")
+            
         except Exception as ex:
             print(f"[BookShelf] FilePicker ERROR: {ex}")
             import traceback
@@ -92,8 +119,10 @@ class BookShelf(ft.View):
 
     def _add_book(self, path: str):
         if any(b["path"] == path for b in self.books):
+            print(f"[BookShelf] Book already in shelf: {path}")
             return
         try:
+            print(f"[BookShelf] Adding book: {path}")
             reader = open_book(path)
             reader.load()
             self.books.append({
@@ -102,8 +131,9 @@ class BookShelf(ft.View):
                 "author": reader.metadata.author,
                 "pages": reader.get_page_count(),
             })
+            print(f"[BookShelf] Book added successfully: {reader.metadata.title}")
         except Exception as ex:
-            print(f"添加书籍失败: {path}, {ex}")
+            print(f"[BookShelf] ERROR adding book: {path}, {ex}")
             import traceback
             traceback.print_exc()
 

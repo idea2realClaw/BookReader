@@ -59,3 +59,4 @@ linux/
 # Temp files
 tmp_*/
 *.log
+temp/
