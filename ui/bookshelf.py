@@ -107,6 +107,8 @@ class BookShelf(ft.View):
 
     async def _show_path_input(self, e):
         """显示手动输入路径的对话框"""
+        print(f"[BookShelf] 打开路径输入对话框...")
+        
         path_input = ft.TextField(
             label="输入文件路径",
             hint_text="例如: assets/sample.txt",
@@ -138,6 +140,7 @@ class BookShelf(ft.View):
             self.ft_page.update()
         
         dialog = ft.AlertDialog(
+            modal=True,  # 设置为模态对话框
             title=ft.Text("手动输入文件路径"),
             content=ft.Column(
                 [
@@ -151,13 +154,20 @@ class BookShelf(ft.View):
                 tight=True,
             ),
             actions=[
-                ft.TextButton("取消", on_click=lambda e: setattr(dialog, "open", False) or self.ft_page.update()),
+                ft.TextButton("取消", on_click=lambda e: self._close_dialog(dialog)),
                 ft.TextButton("添加", on_click=add_from_path),
             ],
         )
         
+        print(f"[BookShelf] 显示对话框...")
         self.ft_page.dialog = dialog
         dialog.open = True
+        self.ft_page.update()
+        print(f"[BookShelf] 对话框已显示")
+    
+    def _close_dialog(self, dialog):
+        """关闭对话框"""
+        dialog.open = False
         self.ft_page.update()
 
     def _add_book(self, path: str):
