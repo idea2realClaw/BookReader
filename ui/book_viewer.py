@@ -62,7 +62,7 @@ class BookViewer(ft.Container):
                         expand=True,
                     ),
                     expand=True,
-                    padding=ft.Padding(left=50, top=20, right=50, bottom=20),
+                    padding=ft.Padding(left=80, top=30, right=80, bottom=30),
                 ),
                 ft.Row(
                     [
@@ -83,10 +83,12 @@ class BookViewer(ft.Container):
 
     def _update_font_size(self):
         """根据页面宽度调整字体大小"""
-        width = self.ft_page.width or 800
-        if width > 1200:
+        width = self.ft_page.width or 1400
+        if width > 1400:
+            self.page_text.size = 28
+        elif width > 1200:
             self.page_text.size = 24
-        elif width > 800:
+        elif width > 900:
             self.page_text.size = 20
         else:
             self.page_text.size = 18
