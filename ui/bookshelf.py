@@ -234,9 +234,17 @@ class BookShelf(ft.View):
             viewer = BookViewer(reader, self.ft_page, on_close=self._back_to_shelf)
             print(f"[BookShelf] BookViewer created")
             
+            # 创建阅读视图，设置 expand=True 让它铺满
+            read_view = ft.View(
+                route="/read",
+                controls=[viewer],
+                appbar=None,  # 不使用默认 appbar
+                padding=0,  # 无边距
+            )
+            
             self.ft_page.views.clear()
             self.ft_page.views.append(self)
-            self.ft_page.views.append(ft.View(route="/read", controls=[viewer]))
+            self.ft_page.views.append(read_view)
             print(f"[BookShelf] Views updated, pushing route...")
             
             await self.ft_page.push_route("/read")
