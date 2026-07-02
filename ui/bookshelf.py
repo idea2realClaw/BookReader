@@ -107,68 +107,92 @@ class BookShelf(ft.View):
 
     async def _show_path_input(self, e):
         """显示手动输入路径的对话框"""
-        print(f"[BookShelf] 打开路径输入对话框...")
+        print(f"\n[BookShelf] ===== 打开路径输入对话框 =====")
+        print(f"[BookShelf] 事件触发: {type(e)}")
+        print(f"[BookShelf] 页面模式: {'浏览器' if self.ft_page.web else '桌面'}")
         
-        path_input = ft.TextField(
-            label="输入文件路径",
-            hint_text="例如: assets/sample.txt",
-            width=300,
-        )
-        
-        def add_from_path(e):
-            path = path_input.value.strip()
-            if not path:
-                return
+        try:
+            path_input = ft.TextField(
+                label="输入文件路径",
+                hint_text="例如: assets/sample.txt",
+                width=300,
+            )
             
-            print(f"[BookShelf] 手动添加路径: {path}")
+            def add_from_path(e):
+                print(f"[BookShelf] 点击'添加'按钮")
+                path = path_input.value.strip()
+                print(f"[BookShelf] 输入路径: '{path}'")
+                
+                if not path:
+                    print(f"[BookShelf] 路径为空，忽略")
+                    return
+                
+                print(f"[BookShelf] 手动添加路径: {path}")
+                
+                # 检查文件是否存在
+                if not os.path.exists(path):
+                    print(f"[BookShelf] 文件不存在: {path}")
+                    self.ft_page.snack_bar = ft.SnackBar(
+                        content=ft.Text(f"文件不存在: {path}"),
+                        action="OK"
+                    )
+                    self.ft_page.snack_bar.open = True
+                else:
+                    # 添加书籍
+                    print(f"[BookShelf] 文件存在，添加书籍...")
+                    self._add_book(path)
+                    self._refresh_grid()
+                
+                # 关闭对话框
+                print(f"[BookShelf] 关闭对话框...")
+                dialog.open = False
+                self.ft_page.update()
+                print(f"[BookShelf] 对话框已关闭")
             
-            # 检查文件是否存在
-            if not os.path.exists(path):
-                print(f"[BookShelf] 文件不存在: {path}")
-                self.ft_page.snack_bar = ft.SnackBar(
-                    content=ft.Text(f"文件不存在: {path}"),
-                    action="OK"
-                )
-                self.ft_page.snack_bar.open = True
-            else:
-                # 添加书籍
-                self._add_book(path)
-                self._refresh_grid()
+            def cancel_dialog(e):
+                print(f"[BookShelf] 点击'取消'按钮")
+                dialog.open = False
+                self.ft_page.update()
+                print(f"[BookShelf] 对话框已关闭")
             
-            # 关闭对话框
-            dialog.open = False
-            self.ft_page.update()
-        
-        dialog = ft.AlertDialog(
-            modal=True,  # 设置为模态对话框
-            title=ft.Text("手动输入文件路径"),
-            content=ft.Column(
-                [
-                    path_input,
-                    ft.Text(
-                        "提示: 可以输入相对路径（如 assets/sample.txt）或绝对路径",
-                        size=11,
-                        color=ft.Colors.BLACK54,
-                    ),
+            print(f"[BookShelf] 创建 AlertDialog...")
+            dialog = ft.AlertDialog(
+                modal=True,  # 设置为模态对话框
+                title=ft.Text("手动输入文件路径"),
+                content=ft.Column(
+                    [
+                        path_input,
+                        ft.Text(
+                            "提示: 可以输入相对路径（如 assets/sample.txt）或绝对路径",
+                            size=11,
+                            color=ft.Colors.BLACK54,
+                        ),
+                    ],
+                    tight=True,
+                ),
+                actions=[
+                    ft.TextButton("取消", on_click=cancel_dialog),
+                    ft.TextButton("添加", on_click=add_from_path),
                 ],
-                tight=True,
-            ),
-            actions=[
-                ft.TextButton("取消", on_click=lambda e: self._close_dialog(dialog)),
-                ft.TextButton("添加", on_click=add_from_path),
-            ],
-        )
+            )
+            
+            print(f"[BookShelf] 设置 dialog 到页面...")
+            self.ft_page.dialog = dialog
+            
+            print(f"[BookShelf] 设置 dialog.open = True...")
+            dialog.open = True
+            
+            print(f"[BookShelf] 调用 page.update()...")
+            self.ft_page.update()
+            print(f"[BookShelf] page.update() 完成")
+            
+            print(f"[BookShelf] ===== 对话框应该已显示 =====\n")
+            
+        except Exception as ex:
+            print(f"[BookShelf] 错误: {ex}")
+            import traceback
+            traceback.print_exc()
         
-        print(f"[BookShelf] 显示对话框...")
-        self.ft_page.dialog = dialog
-        dialog.open = True
-        self.ft_page.update()
-        print(f"[BookShelf] 对话框已显示")
-    
-    def _close_dialog(self, dialog):
-        """关闭对话框"""
-        dialog.open = False
-        self.ft_page.update()
 
     def _add_book(self, path: str):
         if any(b["path"] == path for b in self.books):
