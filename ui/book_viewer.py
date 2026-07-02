@@ -62,7 +62,7 @@ class BookViewer(ft.Container):
                         expand=True,
                     ),
                     expand=True,
-                    padding=ft.padding.symmetric(horizontal=50, vertical=20),
+                    padding=ft.Padding(left=50, top=20, right=50, bottom=20),
                 ),
                 ft.Row(
                     [
