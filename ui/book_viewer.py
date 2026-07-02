@@ -20,6 +20,9 @@ class BookViewer(ft.Container):
             color=ft.Colors.BLACK87,
             no_wrap=False,
         )
+
+        # 增加字体大小以适应宽屏
+        self._update_font_size()
         self.page_label = ft.Text(size=12, color=ft.Colors.BLACK54)
 
         self.header = ft.Row(
@@ -61,20 +64,33 @@ class BookViewer(ft.Container):
                 ),
                 ft.Row(
                     [
-                        ft.IconButton(ft.Icons.CHEVRON_LEFT, on_click=self.prev_page),
+                        ft.IconButton(ft.Icons.CHEVRON_LEFT, on_click=self.prev_page, icon_size=40),
                         ft.Container(content=self.page_label, alignment=ft.Alignment.CENTER, expand=True),
-                        ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=self.next_page),
+                        ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=self.next_page, icon_size=40),
                     ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                 ),
             ],
             spacing=0,
             expand=True,
+            alignment=ft.MainAxisAlignment.START,
         )
 
         self._update_page_display()
         self.ft_page.on_resize = self._on_resize
 
+    def _update_font_size(self):
+        """根据页面宽度调整字体大小"""
+        width = self.ft_page.width or 800
+        if width > 1200:
+            self.page_text.size = 24
+        elif width > 800:
+            self.page_text.size = 20
+        else:
+            self.page_text.size = 18
+
     def _on_resize(self, e):
+        self._update_font_size()
         self.ft_page.update()
 
     async def _close(self, e):
