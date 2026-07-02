@@ -134,6 +134,22 @@ class BookViewer(ft.Container):
         dialog.open = True
         self.ft_page.update()
 
+    def _update_page_display(self):
+        text = self.reader.get_page(self.current)
+        self.page_text.value = text
+        self.page_label.value = f"第 {self.current + 1} / {self.reader.get_page_count()} 页"
+        self.ft_page.update()
+
+    async def next_page(self, e):
+        if self.current < self.reader.get_page_count() - 1:
+            self.current += 1
+            self._update_page_display()
+
+    async def prev_page(self, e):
+        if self.current > 0:
+            self.current -= 1
+            self._update_page_display()
+
     async def _toggle_read(self, e):
         """切换朗读状态"""
         if self._is_reading:
