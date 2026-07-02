@@ -1,5 +1,4 @@
 import os
-import tempfile
 import asyncio
 import flet as ft
 from reader import open_book
@@ -50,110 +49,55 @@ class BookShelf(ft.View):
         ]
 
     async def _pick_file(self, e):
-        """打开文件选择器，支持桌面和浏览器模式"""
-        print(f"\n[BookShelf] ===== FilePicker started =====")
-        print(f"[BookShelf] Is web mode: {self.ft_page.web}")
-        print(f"[BookShelf] Event trigger: {type(e)}")
+        """打开文件选择器"""
+        print(f"\n[BookShelf] 开始选择文件...")
+        print(f"[BookShelf] 模式: {'浏览器' if self.ft_page.web else '桌面'}")
         
         try:
-            # 步骤1: 最简单的调用，不带任何过滤
-            print(f"[BookShelf] Step 1: Calling FilePicker without filters...")
-            result = await ft.FilePicker().pick_files(allow_multiple=False)
-            print(f"[BookShelf] Step 1 result: {result}")
+            # 最简单的调用
+            files = await ft.FilePicker().pick_files(allow_multiple=False)
             
-            if not result or len(result) == 0:
-                print(f"[BookShelf] No file selected, aborting")
+            if not files:
+                print(f"[BookShelf] 用户取消选择")
                 return
             
-            file = result[0]
-            print(f"[BookShelf] Selected file: name={file.name}, path={file.path}, has_bytes={file.bytes is not None}")
+            file = files[0]
+            print(f"[BookShelf] 选中文件: {file.name}")
+            print(f"[BookShelf]   path={file.path}")
+            print(f"[BookShelf]   bytes={'有' if file.bytes else '无'}")
             
-            # 步骤2: 根据模式处理文件
-            if file.path:  # 桌面模式
-                print(f"[BookShelf] Desktop mode: using path directly")
+            # 桌面模式：直接使用路径
+            if file.path:
+                print(f"[BookShelf] 桌面模式，直接添加")
                 self._add_book(file.path)
                 self._refresh_grid()
                 return
             
-            # 浏览器模式：需要获取文件内容
-            print(f"[BookShelf] Browser mode: need to get file content")
+            # 浏览器模式：提示用户
+            print(f"[BookShelf] 浏览器模式下 FilePicker 暂不支持")
+            print(f"[BookShelf] 请使用桌面模式，或手动将文件放到 temp 目录")
             
-            # 步骤3: 使用 with_data=True 重新选择文件
-            print(f"[BookShelf] Step 2: Calling FilePicker with with_data=True...")
-            result2 = await ft.FilePicker().pick_files(
-                allow_multiple=False,
-                with_data=True
+            self.ft_page.snack_bar = ft.SnackBar(
+                content=ft.Text(f"浏览器模式暂不支持文件选择，请使用桌面模式"),
+                action="OK"
             )
-            
-            if not result2 or len(result2) == 0:
-                print(f"[BookShelf] No file selected in step 2")
-                return
-            
-            file2 = result2[0]
-            print(f"[BookShelf] Step 2 result: name={file2.name}, has_bytes={file2.bytes is not None}")
-            
-            if file2.bytes:
-                # 保存到临时文件
-                temp_dir = os.path.join(os.path.dirname(__file__), "..", "temp")
-                os.makedirs(temp_dir, exist_ok=True)
-                temp_path = os.path.join(temp_dir, file2.name)
-                
-                print(f"[BookShelf] Saving to temp file: {temp_path}")
-                with open(temp_path, "wb") as fp:
-                    fp.write(file2.bytes)
-                
-                self._temp_files.append(temp_path)
-                self._add_book(temp_path)
-                self._refresh_grid()
-            else:
-                print(f"[BookShelf] ERROR: Still no file data after with_data=True")
-                self.ft_page.snack_bar = ft.SnackBar(
-                    content=ft.Text(f"无法读取文件内容，请重试"),
-                    action="OK"
-                )
-                self.ft_page.snack_bar.open = True
-                self.ft_page.update()
+            self.ft_page.snack_bar.open = True
+            self.ft_page.update()
             
         except Exception as ex:
-            print(f"[BookShelf] ERROR: {ex}")
-            print(f"[BookShelf] Error type: {type(ex)}")
+            print(f"[BookShelf] 错误: {ex}")
             import traceback
             traceback.print_exc()
             
-            # 显示错误给用户
             self.ft_page.snack_bar = ft.SnackBar(
-                content=ft.Text(f"文件选择失败: {ex}"),
+                content=ft.Text(f"错误: {ex}"),
                 action="OK"
             )
             self.ft_page.snack_bar.open = True
             self.ft_page.update()
         
         finally:
-            print(f"[BookShelf] ===== FilePicker finished =====\n")
-
-    def _process_picked_files(self, files):
-        print(f"[BookShelf] _process_picked_files called with {len(files) if files else 0} files")
-        if not files:
-            print("[BookShelf] No files to process")
-            return
-        
-        for f in files:
-            print(f"[BookShelf] Processing file: {f}")
-            path = f.path if hasattr(f, 'path') else str(f)
-            print(f"[BookShelf] File path: {path}")
-            if not path:
-                print("[BookShelf] Empty path, skipping")
-                continue
-            lower = path.lower()
-            if lower.endswith((".txt", ".epub", ".pdf")):
-                print(f"[BookShelf] Valid file type, adding to shelf: {path}")
-                self._add_book(path)
-            else:
-                print(f"[BookShelf] Invalid file type: {path}")
-        print("[BookShelf] Refreshing grid...")
-        self._refresh_grid()
-        print("[BookShelf] Grid refreshed")
-
+            print(f"[BookShelf] 选择文件结束\n")
 
     def _add_book(self, path: str):
         if any(b["path"] == path for b in self.books):
