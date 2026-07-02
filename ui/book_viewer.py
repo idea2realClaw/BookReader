@@ -127,6 +127,8 @@ class BookViewer(ft.Container):
         text = self.reader.get_page(self.current)
         self.page_text.value = text
         self.page_label.value = f"第 {self.current + 1} / {self.reader.get_page_count()} 页"
+        # 调试：打印宽度信息
+        print(f"[BookViewer] Page width: {self.ft_page.width}, Window width: {self.ft_page.window_width}")
         self.ft_page.update()
 
     async def next_page(self, e):
