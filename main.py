@@ -16,9 +16,10 @@ def main(page: ft.Page):
         page.window_width = 1200
         page.window_height = 800
     else:
-        # 桌面模式：使用移动端尺寸
-        page.window_width = 400
-        page.window_height = 700
+        # 桌面模式：使用更大的窗口尺寸（平板模式）
+        page.window_width = 1000
+        page.window_height = 800
+        page.window_resizable = True
     
     # 导入并创建书架
     from ui.bookshelf import BookShelf

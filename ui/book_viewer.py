@@ -19,9 +19,11 @@ class BookViewer(ft.Container):
             size=18,
             color=ft.Colors.BLACK87,
             no_wrap=False,
+            # 让文字可以自动换行
+            font_family="sans-serif",
         )
 
-        # 增加字体大小以适应宽屏
+        # 设置初始字体大小
         self._update_font_size()
         self.page_label = ft.Text(size=12, color=ft.Colors.BLACK54)
 
@@ -60,7 +62,7 @@ class BookViewer(ft.Container):
                         expand=True,
                     ),
                     expand=True,
-                    padding=20,
+                    padding=ft.padding.symmetric(horizontal=50, vertical=20),
                 ),
                 ft.Row(
                     [
