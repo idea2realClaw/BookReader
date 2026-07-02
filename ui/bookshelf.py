@@ -106,30 +106,24 @@ class BookShelf(ft.View):
             print(f"[BookShelf] 选择文件结束\n")
 
     async def _show_path_input(self, e):
-        """显示手动输入路径的对话框"""
-        print(f"\n[BookShelf] ===== 打开路径输入对话框 =====")
-        print(f"[BookShelf] 事件触发: {type(e)}")
-        print(f"[BookShelf] 页面模式: {'浏览器' if self.ft_page.web else '桌面'}")
+        """显示手动输入路径的浮层"""
+        print(f"\n[BookShelf] ===== 打开路径输入浮层 =====")
         
         try:
             path_input = ft.TextField(
                 label="输入文件路径",
                 hint_text="例如: assets/sample.txt",
-                width=300,
+                width=400,
             )
             
             def add_from_path(e):
                 print(f"[BookShelf] 点击'添加'按钮")
                 path = path_input.value.strip()
-                print(f"[BookShelf] 输入路径: '{path}'")
-                
                 if not path:
-                    print(f"[BookShelf] 路径为空，忽略")
                     return
                 
                 print(f"[BookShelf] 手动添加路径: {path}")
                 
-                # 检查文件是否存在
                 if not os.path.exists(path):
                     print(f"[BookShelf] 文件不存在: {path}")
                     self.ft_page.snack_bar = ft.SnackBar(
@@ -138,61 +132,83 @@ class BookShelf(ft.View):
                     )
                     self.ft_page.snack_bar.open = True
                 else:
-                    # 添加书籍
                     print(f"[BookShelf] 文件存在，添加书籍...")
                     self._add_book(path)
                     self._refresh_grid()
                 
-                # 关闭对话框
-                print(f"[BookShelf] 关闭对话框...")
-                dialog.open = False
-                self.ft_page.update()
-                print(f"[BookShelf] 对话框已关闭")
+                # 隐藏浮层
+                print(f"[BookShelf] 隐藏输入浮层...")
+                self._hide_path_input()
             
-            def cancel_dialog(e):
+            def cancel_input(e):
                 print(f"[BookShelf] 点击'取消'按钮")
-                dialog.open = False
-                self.ft_page.update()
-                print(f"[BookShelf] 对话框已关闭")
+                self._hide_path_input()
             
-            print(f"[BookShelf] 创建 AlertDialog...")
-            dialog = ft.AlertDialog(
-                modal=True,  # 设置为模态对话框
-                title=ft.Text("手动输入文件路径"),
-                content=ft.Column(
-                    [
-                        path_input,
-                        ft.Text(
-                            "提示: 可以输入相对路径（如 assets/sample.txt）或绝对路径",
-                            size=11,
-                            color=ft.Colors.BLACK54,
+            # 创建浮层容器
+            self._path_input_overlay = ft.Container(
+                content=ft.Card(
+                    content=ft.Container(
+                        content=ft.Column(
+                            [
+                                ft.Text("手动输入文件路径", size=18, weight=ft.FontWeight.BOLD),
+                                ft.Container(height=10),
+                                path_input,
+                                ft.Text(
+                                    "提示: 可以输入相对路径（如 assets/sample.txt）或绝对路径",
+                                    size=11,
+                                    color=ft.Colors.BLACK54,
+                                ),
+                                ft.Container(height=10),
+                                ft.Row(
+                                    [
+                                        ft.TextButton("取消", on_click=cancel_input),
+                                        ft.TextButton("添加", on_click=add_from_path),
+                                    ],
+                                    alignment=ft.MainAxisAlignment.END,
+                                ),
+                            ],
+                            tight=True,
                         ),
-                    ],
-                    tight=True,
+                        padding=20,
+                        bgcolor=ft.Colors.WHITE,  # 显式设置背景色
+                        border_radius=10,
+                    ),
+                    elevation=20,  # 高阴影，确保可见
                 ),
-                actions=[
-                    ft.TextButton("取消", on_click=cancel_dialog),
-                    ft.TextButton("添加", on_click=add_from_path),
-                ],
+                # 绝对定位：居中显示
+                left=0,
+                right=0,
+                top=0,
+                bottom=0,
+                alignment=ft.Alignment.CENTER,
+                bgcolor=ft.Colors.BLACK12,  # 半透明背景
             )
             
-            print(f"[BookShelf] 设置 dialog 到页面...")
-            self.ft_page.dialog = dialog
+            print(f"[BookShelf] 创建浮层完成，显示浮层...")
             
-            print(f"[BookShelf] 设置 dialog.open = True...")
-            dialog.open = True
-            
-            print(f"[BookShelf] 调用 page.update()...")
+            # 添加到页面
+            self.ft_page.overlay.append(self._path_input_overlay)
+            self._path_input_overlay.visible = True
             self.ft_page.update()
-            print(f"[BookShelf] page.update() 完成")
             
-            print(f"[BookShelf] ===== 对话框应该已显示 =====\n")
+            print(f"[BookShelf] 浮层已显示")
+            print(f"[BookShelf] ===== 路径输入浮层已打开 =====\n")
             
         except Exception as ex:
             print(f"[BookShelf] 错误: {ex}")
             import traceback
             traceback.print_exc()
         
+    def _hide_path_input(self):
+        """隐藏路径输入浮层"""
+        if hasattr(self, '_path_input_overlay') and self._path_input_overlay:
+            print(f"[BookShelf] 隐藏浮层...")
+            self._path_input_overlay.visible = False
+            # 从 overlay 中移除
+            if self._path_input_overlay in self.ft_page.overlay:
+                self.ft_page.overlay.remove(self._path_input_overlay)
+            self.ft_page.update()
+            print(f"[BookShelf] 浮层已隐藏")
 
     def _add_book(self, path: str):
         if any(b["path"] == path for b in self.books):
