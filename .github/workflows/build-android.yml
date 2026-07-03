@@ -25,12 +25,6 @@ jobs:
         distribution: 'zulu'
         java-version: '17'
     
-    - name: Setup Flutter
-      uses: subosito/flutter-action@v2
-      with:
-        flutter-version: '3.24.5'
-        channel: 'stable'
-    
     - name: Setup Android SDK
       uses: android-actions/setup-android@v3
     
@@ -43,9 +37,16 @@ jobs:
     - name: Install Python dependencies
       run: pip install -r requirements.txt
     
-    - name: Build APK
+    - name: Build APK (with expect)
       run: |
-        flet build apk \
+        # Install expect for auto-answering prompts
+        sudo apt-get update -qq
+        sudo apt-get install -y expect
+        
+        # Run flet build with expect to auto-answer "y"
+        expect -c '
+        set timeout -1
+        spawn flet build apk \
           --project BookReader \
           --org com.bookreader \
           --description "跨平台电子书阅读器" \
@@ -54,6 +55,20 @@ jobs:
           --build-number "1" \
           --android-permissions "READ_EXTERNAL_STORAGE=true" \
           --android-permissions "WRITE_EXTERNAL_STORAGE=true"
+        
+        # Match any prompt asking for confirmation
+        expect {
+          -re "Proceed.*:" {
+            send "y\r"
+            exp_continue
+          }
+          -re "\\[y/n\\]" {
+            send "y\r"
+            exp_continue
+          }
+          eof
+        }
+        '
     
     - name: Upload APK
       uses: actions/upload-artifact@v4
