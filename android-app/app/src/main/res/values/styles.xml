@@ -1,0 +1,15 @@
+<resources>
+    <!-- Base application theme -->
+    <style name="Theme.BookReader" parent="Theme.MaterialComponents.Light.NoActionBar">
+        <item name="colorPrimary">@color/primaryColor</item>
+        <item name="colorPrimaryDark">@color/primaryDarkColor</item>
+        <item name="colorAccent">@color/accentColor</item>
+        <item name="android:statusBarColor">@color/primaryDarkColor</item>
+    </style>
+
+    <style name="Theme.BookReader.AppBarOverlay" parent="ThemeOverlay.AppCompat.Dark.ActionBar" />
+    <style name="Theme.BookReader.PopupOverlay" parent="ThemeOverlay.AppCompat.Light" />
+
+    <style name="Widget.BookReader.TextView" parent="Widget.AppCompat.TextView" />
+    <style name="Widget.BookReader.Button" parent="Widget.AppCompat.Button" />
+</resources>

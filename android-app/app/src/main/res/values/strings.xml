@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">BookReader</string>
+    <string name="add_book">添加书籍</string>
+    <string name="no_books">暂无书籍，点击 + 添加</string>
+    <string name="reading">阅读</string>
+    <string name="previous_page">上一页</string>
+    <string name="next_page">下一页</string>
+    <string name="page_info">第 %1$d 页 / 共 %2$d 页</string>
+    <string name="file_picker_title">选择电子书</string>
+    <string name="error_loading">加载失败</string>
+    <string name="epub_not_implemented">EPUB 阅读功能即将推出</string>
+</resources>
