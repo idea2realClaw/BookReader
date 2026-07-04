@@ -5,7 +5,7 @@
 *.swp
 *.tmp
 *.xml
-*.yml
+# *.yml  # 已注释 - 需要保留 GitHub Actions 工作流
 .gradle
 .idea
 *.iml
@@ -158,3 +158,8 @@ env/
 node_modules/
 jspm_packages/
 **/packages/**
+
+# GitHub Actions (必须保留)
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
