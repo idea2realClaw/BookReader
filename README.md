@@ -1,140 +1,112 @@
-# TTS读书应用
+# BookReader - TTS 读书应用
 
-全平台统一UI的Flutter读书应用，支持离线/在线TTS切换，原生级性能体验。
+基于 Flet 的跨平台电子书阅读器，支持 TTS 语音朗读、句子高亮、自动翻页等功能。
 
-## 功能特点
+## ✨ 功能特点
 
-### 🎯 核心功能
-- **双TTS引擎**：离线 flutter_tts + 在线 Edge TTS 无缝切换
-- **全平台支持**：Android、iOS、macOS、Windows、Web、OpenHarmony
-- **统一UI**：Material Design 3，跨平台一致体验
-- **完整控制**：播放、暂停、停止、进度调节、语速/音调/音量控制
-
-### 🌍 多语言支持
-- 中文（简体/繁体）
-- 英语（美式/英式）
-- 日语、韩语
-- 法语、德语、西班牙语、意大利语
+### 📚 核心功能
+- **多格式支持**：TXT、EPUB、PDF 格式
+- **TTS 语音朗读**：离线 TTS 引擎，支持停止/继续
+- **句子高亮**：朗读时当前句子显示灰色背景
+- **自动翻页**：朗读到页尾自动翻到下一页
+- **位置记忆**：关闭书籍时保存阅读位置，下次从此继续
 
 ### 🎨 用户体验
-- 离线模式：无需联网，使用设备内置TTS引擎
-- 在线模式：Edge TTS 提供更高音质和自然度
-- 实时进度显示和高亮
-- 语音参数自定义
-- 深色模式支持
+- 现代化 UI 设计
+- 实时日志窗口（支持多行选择）
+- 书籍信息本地持久化
+- 响应式布局（根据窗口大小调整字体）
 
-## 技术栈
+### 🖥️ 平台支持
+- ✅ Windows（桌面模式）
+- ✅ macOS（桌面模式）
+- ✅ Linux（桌面模式）
+- 🚧 Web（浏览器模式，部分功能受限）
 
-- **框架**：Flutter 3.0+
-- **状态管理**：Provider
-- **离线TTS**：flutter_tts ^4.0.0
-- **在线TTS**：edge_tts ^0.2.0
-- **音频播放**：audioplayers ^5.3.0
-- **本地存储**：shared_preferences
-
-## 项目结构
-
-```
-lib/
-├── main.dart                 # 应用入口
-├── screens/                  # 页面
-│   └── book_reader_screen.dart  # 主读书界面
-├── services/                 # 服务层
-│   ├── tts_service.dart        # TTS服务（离线/在线）
-│   └── settings_service.dart   # 设置服务
-├── widgets/                  # 组件
-│   ├── tts_control_panel.dart  # TTS控制面板
-│   ├── settings_panel.dart      # 设置面板
-│   └── book_text_view.dart     # 文本显示组件
-├── models/                   # 数据模型
-└── utils/                    # 工具类
-```
-
-## 安装和运行
+## 📦 安装和运行
 
 ### 前置条件
-1. 安装 Flutter SDK (3.0+)
-2. 配置开发环境（Android Studio / Xcode / VS Code）
+1. 安装 Python 3.8+
+2. 安装依赖：`pip install -r requirements.txt`
 
 ### 安装步骤
 
 ```bash
 # 1. 克隆项目
-git clone <repository-url>
-cd book_reader_tts
+git clone https://github.com/idea2realClaw/BookReader.git
+cd BookReader
 
 # 2. 安装依赖
-flutter pub get
+pip install -r requirements.txt
 
-# 3. 运行项目
-flutter run          # 运行在连接的设备上
-flutter run -d chrome  # 运行在Web
-flutter run -d windows  # 运行在Windows
-flutter run -d macos    # 运行在macOS
+# 3. 运行应用（桌面模式）
+python main.py --mode desktop
 ```
 
-### 平台特定配置
+## 🚀 使用说明
 
-#### Android
-- 需要 RECORD_AUDIO 权限（TTS需要）
-- 最低SDK版本：21
-- 目标SDK版本：34
+1. **添加书籍**：点击左上角文件夹图标，选择 TXT/EPUB/PDF 文件
+2. **打开书籍**：点击书籍卡片
+3. **TTS 朗读**：点击播放按钮 ▶️ 开始朗读
+4. **停止朗读**：点击停止按钮 ⏹️
+5. **翻页**：使用左右箭头按钮或键盘
+6. **跳转页面**：点击菜单按钮，输入页码
 
-#### iOS
-- 需要添加麦克风权限描述
-- 部署目标：12.0+
+## 📁 项目结构
 
-#### macOS
-- 需要启用麦克风权限
-- 部署目标：10.14+
+```
+BookReader/
+├── main.py              # 应用入口
+├── ui/                  # UI 组件
+│   ├── bookshelf.py     # 书架界面
+│   ├── book_viewer.py   # 阅读器界面
+│   └── log_window.py    # 日志窗口
+├── reader/              # 阅读器核心逻辑
+│   ├── base.py         # 基类
+│   ├── txt_reader.py   # TXT 格式
+│   ├── epub_reader.py  # EPUB 格式
+│   └── pdf_reader.py   # PDF 格式
+├── assets/              # 资源文件
+└── requirements.txt     # Python 依赖
+```
 
-#### Windows
-- 需要安装 Visual Studio 2019+
-- 配置麦克风权限
+## 🛠️ 技术栈
 
-#### Web
-- 需要 HTTPS 环境（在线TTS）
-- 浏览器需支持 Web Speech API
+- **框架**：Flet 0.85.3
+- **语言**：Python 3.10+
+- **TTS 引擎**：pyttsx3 / SAPI.SpVoice (Windows)
+- **文件解析**：
+  - EPUB：zipfile + html.parser（标准库）
+  - PDF：pdfplumber
+  - TXT：直接读取
 
-## 使用说明
+## 📝 开发计划
 
-1. **选择TTS模式**：点击右上角切换按钮，选择离线或在线模式
-2. **输入文本**：在主界面文本框中输入或粘贴要朗读的文本
-3. **调整参数**：使用控制面板调节语速、音调、音量
-4. **开始朗读**：点击播放按钮开始TTS朗读
-5. **设置**：点击右上角设置图标，配置语言、主题等
-
-## TTS模式对比
-
-| 特性 | 离线TTS (flutter_tts) | 在线TTS (edge_tts) |
-|------|------------------------|---------------------|
-| 需要联网 | ❌ 不需要 | ✅ 需要 |
-| 音质 | ⭐⭐⭐ 中等 | ⭐⭐⭐⭐⭐ 优秀 |
-| 响应速度 | ⚡ 快 | 🌐 取决于网速 |
-| 多语言 | 有限 | 丰富 |
-| 自定义 | 支持 | 支持 |
-
-## 开发计划
-
-- [ ] 支持EPUB/PDF文件导入
+- [x] 支持 EPUB 文件导入
+- [x] TTS 语音朗读
+- [x] 句子级高亮追踪
+- [x] 自动翻页
+- [x] 阅读位置保存/加载
 - [ ] 添加书签和笔记功能
-- [ ] 实现句子级高亮追踪
-- [ ] 添加更多语音和方言
-- [ ] 支持后台播放
-- [ ] 添加睡眠定时功能
+- [ ] 支持更多 TTS 引擎
 - [ ] 实现跨设备同步
 
-## 贡献
+## 🐛 已知问题
 
-欢迎提交Issue和Pull Request！
+- Web 模式下 TTS 功能受限（需要使用 Web Speech API）
+- EPUB 格式支持基本可用，但复杂排版可能有问题
 
-## 许可证
+## 🤝 贡献
+
+欢迎提交 Issue 和 Pull Request！
+
+## 📄 许可证
 
 MIT License
 
-## 作者
+## 👤 作者
 
-龙火儿 - WorkBuddy AI助手
+**龙火儿** - WorkBuddy AI 助手
 
 ---
 

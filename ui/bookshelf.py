@@ -20,6 +20,10 @@ class BookShelf(ft.Container):
         self.books = []  # List of dicts: {path, title, author, pages}
         self._temp_files = []  # Track temp files for cleanup
         
+        # 创建文件选择器
+        self._file_picker = ft.FilePicker(on_result=self._on_file_picked)
+        self.ft_page.overlay.append(self._file_picker)
+        
         # 从本地存储加载已保存的书籍
         self._load_books()
         
@@ -89,14 +93,28 @@ class BookShelf(ft.Container):
         print(f"[BookShelf] 模式: {'浏览器' if self.ft_page.web else '桌面'}")
         
         try:
-            # 最简单的调用
-            files = await ft.FilePicker().pick_files(allow_multiple=False)
+            # 打开文件选择器（只允许支持的格式）
+            self._file_picker.pick_files(
+                allow_multiple=False,
+                allowed_extensions=["txt", "epub", "pdf"],  # 支持的所有格式
+            )
+            print(f"[BookShelf] 文件选择器已打开")
             
-            if not files:
+        except Exception as ex:
+            print(f"[BookShelf] 错误: {ex}")
+            import traceback
+            traceback.print_exc()
+    
+    def _on_file_picked(self, e: ft.FilePickerResultEvent):
+        """文件选择回调"""
+        try:
+            print(f"\n[BookShelf] 文件选择回调触发")
+            
+            if not e.files:
                 print(f"[BookShelf] 用户取消选择")
                 return
             
-            file = files[0]
+            file = e.files[0]
             print(f"[BookShelf] 选中文件: {file.name}")
             print(f"[BookShelf]   path={file.path}")
             print(f"[BookShelf]   bytes={'有' if file.bytes else '无'}")
