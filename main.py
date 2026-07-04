@@ -1,12 +1,69 @@
+"""
+主窗口布局：管理内容区域和日志窗口
+"""
 import flet as ft
-import os
-import sys
-import argparse
+import time
+from ui.bookshelf import BookShelf
+from ui.log_window import LogWindow
 
+
+class MainWindow(ft.Column):
+    """主窗口：包含内容区域和可折叠的日志窗口"""
+    
+    def __init__(self, page: ft.Page):
+        super().__init__(expand=True, spacing=0)
+        
+        self.ft_page = page
+        
+        # 创建日志窗口
+        self.log_window = LogWindow(page, max_height=200)
+        
+        # 创建书架（主内容）
+        self.bookshelf = BookShelf(self)
+        
+        # 创建内容容器（用于切换内容）
+        self.content_container = ft.Container(
+            content=self.bookshelf,
+            expand=True,
+        )
+        
+        # 创建分隔线
+        self.divider = ft.Divider(height=2, color=ft.Colors.GREY_300)
+        
+        # 主布局
+        self.controls = [
+            self.content_container,
+            self.divider,
+            self.log_window,
+        ]
+        
+        # 设置日志捕获
+        self.log_window.setup_log_capture()
+        
+        print("[MainWindow] 主窗口已初始化")
+    
+    def navigate_to_viewer(self, viewer):
+        """导航到书籍阅读器"""
+        print(f"[MainWindow] 导航到阅读器")
+        self.content_container.content = viewer
+        self.ft_page.update()
+    
+    def navigate_to_shelf(self):
+        """导航回书架"""
+        print(f"[MainWindow] 导航回书架")
+        self.content_container.content = self.bookshelf
+        self.ft_page.update()
+    
+    def cleanup(self):
+        """清理资源"""
+        self.log_window.cleanup()
+
+
+VERSION = "1.0.3"  # 版本号（每次重启修改此版本号）
 
 def main(page: ft.Page):
     """主应用入口"""
-    page.title = "BookReader"
+    page.title = f"BookReader v{VERSION}"  # 添加版本号到标题
     page.theme_mode = ft.ThemeMode.LIGHT
     page.padding = 0
     
@@ -21,14 +78,28 @@ def main(page: ft.Page):
         page.window_height = 900
         page.window_resizable = True
     
-    # 导入并创建书架
-    from ui.bookshelf import BookShelf
-    shelf = BookShelf(page)
-    page.views.append(shelf)
-    page.update()
+    # 创建主窗口
+    main_window = MainWindow(page)
+    
+    # 添加到页面
+    page.add(main_window)
+    
+    # 保存引用以便清理
+    page.main_window = main_window
+    
+    print("[main] 应用已启动")
+    print(f"[main] 缓存版本: {int(time.time())}")
 
 
 if __name__ == "__main__":
+    import sys
+    import os
+    import argparse
+    
+    # 生成启动时间戳（用于强制浏览器重新加载）
+    STARTUP_TIMESTAMP = int(time.time())
+    print(f"启动时间戳: {STARTUP_TIMESTAMP}")
+    
     # 命令行参数解析
     parser = argparse.ArgumentParser(description="BookReader - 跨平台电子书阅读器")
     parser.add_argument(
@@ -58,6 +129,13 @@ if __name__ == "__main__":
     
     if args.mode == "browser":
         print(f"App will open in browser at: http://{args.host}:{args.port}")
+        print(f"禁用缓存: 是 (时间戳: {STARTUP_TIMESTAMP})")
+        
+        # 添加无缓存参数到 URL
+        import webbrowser
+        url = f"http://{args.host}:{args.port}?_t={STARTUP_TIMESTAMP}"
+        print(f"访问 URL: {url}")
+        
         ft.run(
             main,
             assets_dir="assets",

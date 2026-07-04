@@ -1,36 +1,44 @@
 import flet as ft
 import asyncio
-
+import threading
+import json
+import os
+import re
 from reader import open_book, BookReader
+
+BOOKS_JSON_PATH = os.path.expanduser("~/.bookreader/books.json")
 
 
 class BookViewer(ft.Container):
     """Single-page book viewer with TTS read-aloud support."""
 
-    def __init__(self, reader: BookReader, page: ft.Page, on_close=None):
+    def __init__(self, reader: BookReader, main_window, on_close=None):
         super().__init__(expand=True)
         self.reader = reader
-        self.ft_page = page
+        self.main_window = main_window
+        self.ft_page = main_window.ft_page
         self.on_close = on_close
         self.current = 0
         self._is_reading = False
-        self._stop_reading = False
+        self._tts_stop_event = threading.Event()
+        self._current_sentence_idx = -1
+        self._sentence_controls = []
+        self._tts_engine = None
+        self._tts_process = None  # 保存TTS进程
 
-        self.page_text = ft.Text(
-            selectable=True,
-            size=18,
-            color=ft.Colors.BLACK87,
-            no_wrap=False,
-            font_family="sans-serif",
+        # 页面文本容器（按句子显示，支持高亮）
+        self.page_column = ft.Column(
+            scroll=ft.ScrollMode.AUTO,
+            expand=True,
+            spacing=5,
         )
 
-        self._update_font_size()
         self.page_label = ft.Text(size=12, color=ft.Colors.BLACK54)
 
         # 朗读按钮
         self.read_btn = ft.IconButton(
             ft.Icons.PLAY_ARROW,
-            tooltip="朗读当前页",
+            tooltip="朗读全书",
             icon_color=ft.Colors.BLUE,
             on_click=self._toggle_read,
         )
@@ -64,11 +72,7 @@ class BookViewer(ft.Container):
             [
                 self.header,
                 ft.Container(
-                    content=ft.Column(
-                        [self.page_text],
-                        scroll=ft.ScrollMode.AUTO,
-                        expand=True,
-                    ),
+                    content=self.page_column,
                     expand=True,
                     padding=ft.Padding(left=80, top=30, right=80, bottom=30),
                 ),
@@ -87,26 +91,90 @@ class BookViewer(ft.Container):
             alignment=ft.MainAxisAlignment.START,
         )
 
+        # 加载保存的位置
+        self._load_position()
         self._update_page_display()
         self.ft_page.on_resize = self._on_resize
 
-    def _update_font_size(self):
-        """根据页面宽度调整字体大小"""
+    def _split_into_sentences(self, text: str):
+        """将文本分割成句子"""
+        if not text:
+            return []
+        sentences = re.split(r'(?<=[。！？\.\!\?])\s*', text)
+        return [s.strip() for s in sentences if s.strip()]
+
+    def _update_page_display(self):
+        """更新页面显示（按句子分割以支持高亮）"""
+        text = self.reader.get_page(self.current)
+        sentences = self._split_into_sentences(text)
+
+        # 创建句子控件
+        self._sentence_controls = []
+        self.page_column.controls.clear()
+
+        for sentence in sentences:
+            text_control = ft.Text(
+                sentence,
+                size=self._get_font_size(),
+                color=ft.Colors.BLACK87,
+                selectable=True,
+            )
+            self._sentence_controls.append(text_control)
+            self.page_column.controls.append(text_control)
+
+        self.page_label.value = f"第 {self.current + 1} / {self.reader.get_page_count()} 页"
+        self.ft_page.update()
+
+    def _get_font_size(self):
+        """获取当前字体大小"""
         width = self.ft_page.width or 1400
         if width > 1400:
-            self.page_text.size = 28
+            return 28
         elif width > 1200:
-            self.page_text.size = 24
+            return 24
         elif width > 900:
-            self.page_text.size = 20
+            return 20
         else:
-            self.page_text.size = 18
+            return 18
 
-    def _on_resize(self, e):
-        self._update_font_size()
+    def _update_font_size(self):
+        """根据页面宽度调整字体大小"""
+        new_size = self._get_font_size()
+        for control in self._sentence_controls:
+            control.size = new_size
+        self.ft_page.update()
+
+    async def _highlight_sentence(self, idx: int):
+        """高亮指定句子（灰色背景）"""
+        # 清除之前的高亮
+        if 0 <= self._current_sentence_idx < len(self._sentence_controls):
+            self._sentence_controls[self._current_sentence_idx].bgcolor = None
+
+        # 高亮当前句子
+        if 0 <= idx < len(self._sentence_controls):
+            self._sentence_controls[idx].bgcolor = ft.Colors.GREY_300
+            self._current_sentence_idx = idx
+            # 滚动到当前句子
+            self.page_column.scroll_to(delta=100)
+            self.ft_page.update()
+
+    async def _clear_highlight(self):
+        """清除所有高亮"""
+        for control in self._sentence_controls:
+            control.bgcolor = None
+        self._current_sentence_idx = -1
         self.ft_page.update()
 
     async def _close(self, e):
+        """关闭阅读器，保存位置"""
+        # 停止朗读
+        if self._is_reading:
+            self._tts_stop_event.set()
+            self._is_reading = False
+
+        # 保存阅读位置
+        self._save_position()
+
         if self.on_close:
             await self.on_close()
 
@@ -134,138 +202,249 @@ class BookViewer(ft.Container):
         dialog.open = True
         self.ft_page.update()
 
-    def _update_page_display(self):
-        text = self.reader.get_page(self.current)
-        self.page_text.value = text
-        self.page_label.value = f"第 {self.current + 1} / {self.reader.get_page_count()} 页"
-        self.ft_page.update()
-
     async def next_page(self, e):
         if self.current < self.reader.get_page_count() - 1:
             self.current += 1
+            await self._clear_highlight()
             self._update_page_display()
 
     async def prev_page(self, e):
         if self.current > 0:
             self.current -= 1
+            await self._clear_highlight()
             self._update_page_display()
+
+    def _on_resize(self, e):
+        self._update_font_size()
+        self.ft_page.update()
 
     async def _toggle_read(self, e):
         """切换朗读状态"""
         if self._is_reading:
             # 停止朗读
-            self._stop_reading = True
+            self._tts_stop_event.set()
             self._is_reading = False
             self.read_btn.icon = ft.Icons.PLAY_ARROW
-            self.read_btn.tooltip = "朗读当前页"
+            self.read_btn.tooltip = "朗读全书"
+            await self._clear_highlight()
             self.ft_page.update()
             print(f"[BookViewer] 停止朗读")
         else:
             # 开始朗读
+            self._tts_stop_event.clear()
             self._is_reading = True
-            self._stop_reading = False
             self.read_btn.icon = ft.Icons.STOP_CIRCLE
             self.read_btn.tooltip = "停止朗读"
             self.ft_page.update()
             print(f"[BookViewer] 开始朗读")
-            
-            # 在后台任务中朗读
-            asyncio.create_task(self._read_current_page())
 
-    async def _read_current_page(self):
-        """朗读当前页，然后自动翻页"""
-        while self._is_reading and not self._stop_reading:
+            # 在后台任务中朗读
+            asyncio.create_task(self._read_all())
+
+    async def _read_all(self):
+        """从当前页开始朗读，自动翻页"""
+        while self._is_reading and not self._tts_stop_event.is_set():
             try:
                 # 获取当前页文本
                 text = self.reader.get_page(self.current)
-                
+
                 if not text:
-                    print(f"[BookViewer] 第{self.current+1}页无文本，停止朗读")
+                    print(f"[BookViewer] 第{self.current+1}页无文本，跳过")
+                    if self.current < self.reader.get_page_count() - 1:
+                        self.current += 1
+                        self._update_page_display()
+                        continue
+                    else:
+                        break
+
+                print(f"[BookViewer] 朗读第{self.current+1}页")
+
+                # 按句子朗读
+                sentences = self._split_into_sentences(text)
+                for i, sentence in enumerate(sentences):
+                    if self._tts_stop_event.is_set():
+                        print(f"[BookViewer] 朗读被停止")
+                        break
+
+                    # 高亮当前句子
+                    await self._highlight_sentence(i)
+
+                    # 朗读当前句子
+                    await self._speak_text(sentence)
+
+                if self._tts_stop_event.is_set():
                     break
-                
-                print(f"[BookViewer] 朗读第{self.current+1}页，文本长度: {len(text)} 字符")
-                
-                # 调用TTS朗读（使用系统TTS或在线TTS）
-                await self._speak_text(text)
-                
-                # 检查是否需要停止
-                if self._stop_reading or not self._is_reading:
-                    print(f"[BookViewer] 朗读被停止")
-                    break
-                
+
                 # 自动翻页
                 if self.current < self.reader.get_page_count() - 1:
                     self.current += 1
+                    await self._clear_highlight()
                     self._update_page_display()
                     print(f"[BookViewer] 自动翻到第{self.current+1}页")
                 else:
                     # 已到最后一页
                     print(f"[BookViewer] 已到最后一页，停止朗读")
                     break
-                
+
             except Exception as ex:
                 print(f"[BookViewer] 朗读错误: {ex}")
                 import traceback
                 traceback.print_exc()
                 break
-        
+
         # 朗读结束，恢复按钮状态
         self._is_reading = False
-        self._stop_reading = False
+        self._tts_stop_event.clear()
         self.read_btn.icon = ft.Icons.PLAY_ARROW
-        self.read_btn.tooltip = "朗读当前页"
+        self.read_btn.tooltip = "朗读全书"
+        await self._clear_highlight()
         self.ft_page.update()
         print(f"[BookViewer] 朗读结束")
 
+        # 保存阅读位置
+        self._save_position()
+
     async def _speak_text(self, text: str):
-        """使用TTS朗读文本（简化版：使用Windows系统TTS）"""
+        """使用TTS朗读文本（支持停止）"""
+        if not text:
+            return
+
         print(f"[BookViewer] TTS朗读: {len(text)} 字符")
-        
+
         if self.ft_page.web:
             # 浏览器模式：使用Web Speech API
-            print(f"[BookViewer] 浏览器模式暂不支持TTS，跳过")
-            # 等待一段时间模拟朗读
-            words = len(text) / 3  # 中文约每秒3字
-            await asyncio.sleep(min(words / 10, 5))  # 最多等待5秒
+            await asyncio.sleep(len(text) / 10)  # 模拟朗读时间
         else:
-            # 桌面模式：使用Windows系统TTS（SAPI）
+            # 桌面模式：使用独立进程运行TTS（避免崩溃）
             try:
-                import subprocess
-                import tempfile
-                import os
-                
-                # 截断文本（避免过长）
-                text = text[:2000]
-                
-                # 创建VBScript临时文件（调用Windows SAPI）
-                vbs_script = f'''Set speak = CreateObject("SAPI.SpVoice")
+                await asyncio.to_thread(self._speak_with_process, text)
+            except Exception as ex:
+                print(f"[BookViewer] TTS错误: {ex}")
+                await asyncio.sleep(1)
+
+    def _speak_with_process(self, text: str):
+        """使用独立进程朗读（支持停止）"""
+        try:
+            import subprocess
+            import tempfile
+            import os
+            import time
+
+            # 限制文本长度
+            text = text[:200]
+
+            # 创建VBScript
+            vbs_script = f'''Set speak = CreateObject("SAPI.SpVoice")
 speak.Rate = 2
 speak.Speak "{text.replace(chr(34), "'").replace(chr(10), " ").replace(chr(13), " ")}"
 '''
-                
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.vbs', encoding='ansi') as f:
-                    f.write(vbs_script)
-                    vbs_path = f.name
-                
-                print(f"[BookViewer] 运行Windows TTS: {vbs_path}")
-                
-                # 运行VBScript（同步等待完成）
-                result = subprocess.run(['cscript', '//nologo', vbs_path], 
-                                    capture_output=True, 
-                                    text=True,
-                                    timeout=300)  # 5分钟超时
-                
-                print(f"[BookViewer] TTS完成: {result.returncode}")
-                
-                # 清理临时文件
-                try:
-                    os.unlink(vbs_path)
-                except:
-                    pass
-                
-            except subprocess.TimeoutExpired:
-                print(f"[BookViewer] TTS超时")
-            except Exception as ex:
-                print(f"[BookViewer] TTS错误: {ex}")
-                # 至少等待一段时间
-                await asyncio.sleep(2)
+
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.vbs', encoding='ansi') as f:
+                f.write(vbs_script)
+                vbs_path = f.name
+
+            # 启动进程
+            self._tts_process = subprocess.Popen(
+                ['cscript', '//nologo', vbs_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # 等待进程完成或停止事件
+            while self._tts_process.poll() is None:
+                if self._tts_stop_event.is_set():
+                    print(f"[BookViewer] 停止TTS进程")
+                    self._tts_process.terminate()
+                    try:
+                        self._tts_process.wait(timeout=1)
+                    except:
+                        self._tts_process.kill()
+                    break
+                time.sleep(0.1)
+
+            # 清理临时文件
+            try:
+                os.unlink(vbs_path)
+            except:
+                pass
+
+            self._tts_process = None
+
+        except Exception as e:
+            print(f"[BookViewer] TTS进程错误: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+
+    def _save_position(self):
+        """保存当前阅读位置到本地"""
+        try:
+            os.makedirs(os.path.dirname(BOOKS_JSON_PATH), exist_ok=True)
+
+            if os.path.exists(BOOKS_JSON_PATH):
+                with open(BOOKS_JSON_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = {"books": []}
+
+            # 获取当前书籍路径
+            book_path = ""
+            if hasattr(self.reader, 'file_path'):
+                book_path = self.reader.file_path
+            elif hasattr(self.reader, '_file_path'):
+                book_path = self.reader._file_path
+
+            if not book_path:
+                print(f"[BookViewer] 无法获取书籍路径，跳过保存位置")
+                return
+
+            # 更新当前书籍的位置
+            found = False
+            for book in data["books"]:
+                if book["path"] == book_path:
+                    book["last_page"] = self.current
+                    found = True
+                    break
+
+            if not found:
+                data["books"].append({
+                    "path": book_path,
+                    "title": self.reader.metadata.title,
+                    "author": self.reader.metadata.author,
+                    "pages": self.reader.get_page_count(),
+                    "last_page": self.current,
+                })
+
+            with open(BOOKS_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            print(f"[BookViewer] 已保存阅读位置: 第{self.current+1}页")
+        except Exception as e:
+            print(f"[BookViewer] 保存位置失败: {e}")
+
+    def _load_position(self):
+        """从本地加载保存的阅读位置"""
+        try:
+            if os.path.exists(BOOKS_JSON_PATH):
+                with open(BOOKS_JSON_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+            # 获取当前书籍路径
+            book_path = ""
+            if hasattr(self.reader, 'file_path'):
+                book_path = self.reader.file_path
+            elif hasattr(self.reader, '_file_path'):
+                book_path = self.reader._file_path
+
+            if not book_path:
+                return
+
+            for book in data["books"]:
+                if book["path"] == book_path:
+                    if "last_page" in book and book["last_page"] < self.reader.get_page_count():
+                        self.current = book["last_page"]
+                        print(f"[BookViewer] 已加载阅读位置: 第{self.current+1}页")
+                    break
+        except Exception as e:
+            print(f"[BookViewer] 加载位置失败: {e}")

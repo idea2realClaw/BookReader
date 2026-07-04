@@ -1,117 +1,143 @@
-# BookReader
+# TTS读书应用
 
-一个基于 [Flet](https://flet.dev/) 构建的跨平台电子书阅读器，支持打开本地 `.txt`、`.epub`、`.pdf` 书籍，并带有仿真 3D 翻页效果。
+全平台统一UI的Flutter读书应用，支持离线/在线TTS切换，原生级性能体验。
 
-## 功能
+## 功能特点
 
-- 书架式管理，通过系统文件选择器添加书籍。
-- 支持 TXT / EPUB / PDF 三种格式（均为纯 Python 解析，便于打包到 Android）。
-- 阅读界面点击右侧翻下一页、点击左侧翻回上一页。
-- 3D 透视翻页动画（Y 轴旋转 + 动态阴影）。
-- 顶部跳转页码、返回书架。
+### 🎯 核心功能
+- **双TTS引擎**：离线 flutter_tts + 在线 Edge TTS 无缝切换
+- **全平台支持**：Android、iOS、macOS、Windows、Web、OpenHarmony
+- **统一UI**：Material Design 3，跨平台一致体验
+- **完整控制**：播放、暂停、停止、进度调节、语速/音调/音量控制
+
+### 🌍 多语言支持
+- 中文（简体/繁体）
+- 英语（美式/英式）
+- 日语、韩语
+- 法语、德语、西班牙语、意大利语
+
+### 🎨 用户体验
+- 离线模式：无需联网，使用设备内置TTS引擎
+- 在线模式：Edge TTS 提供更高音质和自然度
+- 实时进度显示和高亮
+- 语音参数自定义
+- 深色模式支持
+
+## 技术栈
+
+- **框架**：Flutter 3.0+
+- **状态管理**：Provider
+- **离线TTS**：flutter_tts ^4.0.0
+- **在线TTS**：edge_tts ^0.2.0
+- **音频播放**：audioplayers ^5.3.0
+- **本地存储**：shared_preferences
 
 ## 项目结构
 
 ```
-BookReader/
-├── main.py              # 应用入口
-├── requirements.txt     # 依赖
-├── reader/              # 书籍解析器
-│   ├── base.py
-│   ├── txt_reader.py
-│   ├── epub_reader.py   # 纯标准库实现
-│   └── pdf_reader.py    # 基于 pypdf 纯 Python
-├── ui/                  # Flet UI
-│   ├── bookshelf.py
-│   └── book_viewer.py   # 阅读器 + 翻页动画
-├── assets/              # 示例书籍
-│   ├── sample.txt
-│   ├── sample.pdf
-│   └── sample.epub
-└── smoke_test.py        # 解析器与 UI 构造测试
+lib/
+├── main.dart                 # 应用入口
+├── screens/                  # 页面
+│   └── book_reader_screen.dart  # 主读书界面
+├── services/                 # 服务层
+│   ├── tts_service.dart        # TTS服务（离线/在线）
+│   └── settings_service.dart   # 设置服务
+├── widgets/                  # 组件
+│   ├── tts_control_panel.dart  # TTS控制面板
+│   ├── settings_panel.dart      # 设置面板
+│   └── book_text_view.dart     # 文本显示组件
+├── models/                   # 数据模型
+└── utils/                    # 工具类
 ```
 
-## 本地运行
+## 安装和运行
 
-BookReader 支持两种运行模式：
+### 前置条件
+1. 安装 Flutter SDK (3.0+)
+2. 配置开发环境（Android Studio / Xcode / VS Code）
 
-### 1. 浏览器模式（推荐，默认）
-
-应用在默认浏览器中打开，避免 Windows WebView2 问题。
-
-**Windows (PowerShell):**
-```powershell
-cd D:\DiskD\GitHub\BookReader
-.venv\Scripts\python.exe main.py
-```
-
-**或使用启动脚本：**
-```powershell
-cd D:\DiskD\GitHub\BookReader
-.\run.bat
-```
-
-**自定义端口：**
-```powershell
-.venv\Scripts\python.exe main.py --mode browser --port 8080
-```
-
-### 2. 桌面模式
-
-应用作为原生桌面窗口打开（需要系统安装 WebView2 运行时）。
-
-```powershell
-.venv\Scripts\python.exe main.py --mode desktop
-```
-
-### Linux/Mac
+### 安装步骤
 
 ```bash
-cd /path/to/BookReader
-.venv/bin/python main.py
+# 1. 克隆项目
+git clone <repository-url>
+cd book_reader_tts
+
+# 2. 安装依赖
+flutter pub get
+
+# 3. 运行项目
+flutter run          # 运行在连接的设备上
+flutter run -d chrome  # 运行在Web
+flutter run -d windows  # 运行在Windows
+flutter run -d macos    # 运行在macOS
 ```
 
-### 手动安装依赖
+### 平台特定配置
 
-如果 .venv 不存在，先创建虚拟环境：
+#### Android
+- 需要 RECORD_AUDIO 权限（TTS需要）
+- 最低SDK版本：21
+- 目标SDK版本：34
 
-```bash
-cd D:\DiskD\GitHub\BookReader
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
+#### iOS
+- 需要添加麦克风权限描述
+- 部署目标：12.0+
 
-## 运行测试
+#### macOS
+- 需要启用麦克风权限
+- 部署目标：10.14+
 
-```bash
-.venv\Scripts\python.exe smoke_test.py
-```
+#### Windows
+- 需要安装 Visual Studio 2019+
+- 配置麦克风权限
 
-## 打包 Android APK（需要 Android 环境）
+#### Web
+- 需要 HTTPS 环境（在线TTS）
+- 浏览器需支持 Web Speech API
 
-1. 安装 Flutter SDK、Android SDK / NDK、Java。
-2. 确保 `flet-cli` 已安装：
+## 使用说明
 
-```bash
-.venv\Scripts\python.exe -m pip install flet-cli
-```
+1. **选择TTS模式**：点击右上角切换按钮，选择离线或在线模式
+2. **输入文本**：在主界面文本框中输入或粘贴要朗读的文本
+3. **调整参数**：使用控制面板调节语速、音调、音量
+4. **开始朗读**：点击播放按钮开始TTS朗读
+5. **设置**：点击右上角设置图标，配置语言、主题等
 
-3. 构建 APK：
+## TTS模式对比
 
-```bash
-.venv\Scripts\flet.exe build apk --project BookReader --product BookReader --org com.example
-```
+| 特性 | 离线TTS (flutter_tts) | 在线TTS (edge_tts) |
+|------|------------------------|---------------------|
+| 需要联网 | ❌ 不需要 | ✅ 需要 |
+| 音质 | ⭐⭐⭐ 中等 | ⭐⭐⭐⭐⭐ 优秀 |
+| 响应速度 | ⚡ 快 | 🌐 取决于网速 |
+| 多语言 | 有限 | 丰富 |
+| 自定义 | 支持 | 支持 |
 
-4. 输出位于 `build/apk/`。
+## 开发计划
 
-## 依赖说明
+- [ ] 支持EPUB/PDF文件导入
+- [ ] 添加书签和笔记功能
+- [ ] 实现句子级高亮追踪
+- [ ] 添加更多语音和方言
+- [ ] 支持后台播放
+- [ ] 添加睡眠定时功能
+- [ ] 实现跨设备同步
 
-- `flet`：跨平台 UI 框架。
-- `pypdf`：纯 Python PDF 解析器，无需原生扩展，Android 打包友好。
-- EPUB 与 TXT 使用 Python 标准库解析。
+## 贡献
 
-## 注意事项
+欢迎提交Issue和Pull Request！
 
-- 首次在桌面运行时，文件选择器会弹出系统对话框。
-- 在 Android 上，文件选择器会调用系统 SAF / 文件选择器。
-- 翻页动画使用 Flet 的 `Transform` + `Matrix4` 实现 3D 透视旋转。
+## 许可证
+
+MIT License
+
+## 作者
+
+龙火儿 - WorkBuddy AI助手
+
+---
+
+**师父**：朱晓冬（字守中，号知常公子）
+
+**师门**：岁寒三友 - 龙松、龙竹、龙梅

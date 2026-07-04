@@ -1,62 +1,129 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.so
-*.egg
-*.egg-info/
-dist/
-build/
-eggs/
-parts/
-bin/
-var/
-sdist/
-develop-eggs/
-.installed.cfg
-lib64/
-__pypackages__/
-
-# Virtual environments
-.venv/
-venv/
-env/
-ENV/
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# WorkBuddy
-.workbuddy/
-
-# Assets - sample files (keep directory but ignore generated samples)
-assets/sample.txt
-assets/sample.pdf
-assets/sample.epub
-assets/make_sample_pdf.py
-assets/make_sample_epub.py
-
-# OS
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Flet build artifacts
-build/
-android/
-ios/
-web/
-macos/
-windows/
-linux/
-
-# Temp files
-tmp_*/
+# Miscellaneous
+*.class
 *.log
-temp/
+*.pyc
+*.swp
+*.tmp
+*.xml
+*.yml
+.gradle
+.idea
+*.iml
+.vscode
+.DS_Store
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+package_config.json
+.pub-cache/
+.pub/
+build/
+flutter_*.png
+linked_*.ds
+unlinked.ds
+**/exception_msbuild_outputs.log
+**/exception_msbuild_logs/
+
+# Android related
+**/android/**/gradle-wrapper.jar
+**/android/.gradle
+**/android/captures/
+**/android/generated/
+**/android/key.properties
+**/android/local.properties
+**/android/**/key.jks
+**/android/**/keystore.jks
+
+# iOS/XCode related
+**/ios/**/*.mode1v3
+**/ios/**/*.pbxuser
+**/ios/**/*.perspectivev3
+**/ios/**/*sync/
+**/ios/**/.sconsigndb
+**/ios/**/scons-out/
+**/ios/**/DartPackage.xcconfig
+**/ios/Flutter/Debug.xcconfig
+**/ios/Flutter/Release.xcconfig
+**/ios/Flutter/Generated.xcconfig
+**/ios/Runner.xcodeproj/project.xcworkspace/
+**/ios/Runner.xcodeproj/xcuserdata/
+**/ios/Runner.xcworkspace/
+**/ios/.symlinks/
+**/ios/**/Pods/
+**/ios/*.pbxuser
+**/ios/*.mode1v3
+**/ios/*.perspectivev3
+**/ios/*sync/
+**/ios/**/.sconsigndb
+**/ios/**/scons-out/
+**/ios/**/DartPackage.xcconfig
+
+# macOS
+**/macos/.symlinks/
+**/macos/**/Pods/
+**/macos/**/Podfile.lock
+**/macos/**/Flutter/GeneratedPluginRegistrant.swift
+**/macos/**/Flutter/ephemeral/
+**/macos/**/Flutter/Flutter-Debug.xcconfig
+**/macos/**/Flutter/Flutter-Release.xcconfig
+
+# Linux
+**/linux/**/flutter/ephemeral/
+**/linux/**/bundle/
+
+# Windows
+**/windows/**/flutter/ephemeral/
+**/windows/flutter/generated_plugin_registrant.cc
+**/windows/flutter/generated_plugin_registrant.h
+**/windows/flutter/generated_plugins.cmake
+
+# Web
+**/web/**/flutter_service_worker.js
+**/web/**/canvaskit/
+**/web/**/color_transform.js
+**/web/**/drawer/
+**/web/**/flutter.js
+**/web/**/flutter_bootstrap.js
+**/web/**/icudtl.dat
+**/web/**/version.json
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map
+
+# Coverage
+coverage/
+*.lcov
+
+# Symbols
+app.*.symbols.tar.gz
+
+# Flet/Server related
+**/assets/**
+**/python/**
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# Dependencies
+node_modules/
+jspm_packages/
+**/packages/**
