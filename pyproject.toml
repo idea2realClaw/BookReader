@@ -1,0 +1,13 @@
+[project]
+name = "bookreader"
+version = "1.0.0"
+description = "A simple and elegant eBook reader"
+
+[tool.flet]
+product = "BookReader"
+org = "com.bookreader.app"
+description = "A simple and elegant eBook reader"
+
+[build-system]
+requires = ["flet"]
+build-backend = "flet.build:build_backend"

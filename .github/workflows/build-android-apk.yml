@@ -46,8 +46,9 @@ jobs:
         run: |
           cd ${{ github.workspace }}
           flet build apk \
+            --project bookreader \
+            --product "BookReader" \
             --org com.bookreader.app \
-            --name "BookReader" \
             --description "A simple and elegant eBook reader" \
             --build-number ${{ github.run_number }} \
             --build-version 1.0.${{ github.run_number }}
