@@ -21,12 +21,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.24.5'
-          channel: 'stable'
-
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -38,11 +32,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install flet Pillow
 
-      - name: Accept Android licenses
-        run: |
-          yes | flutter doctor --android-licenses || true
-
       - name: Build APK
+        env:
+          FLET_CLI_SKIP_FLUTTER_DOCTOR: "true"
         run: |
           cd ${{ github.workspace }}
           flet build apk \
@@ -51,13 +43,15 @@ jobs:
             --org com.bookreader.app \
             --description "A simple and elegant eBook reader" \
             --build-number ${{ github.run_number }} \
-            --build-version 1.0.${{ github.run_number }}
+            --build-version 1.0.${{ github.run_number }} \
+            --yes
 
       - name: Upload APK as artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bookreader-android-apk
-          path: build/**/*.apk
+          path: build/apk/*.apk
           retention-days: 30
 
       - name: Create Release (on push to main)
@@ -70,15 +64,15 @@ jobs:
             📱 BookReader Android APK 自动构建
 
             ## 安装方法
-            1. 下载 `app-release.apk`
+            1. 下载 `BookReader.apk`
             2. 在 Android 设备上允许"安装未知来源应用"
             3. 点击 APK 文件安装
 
             ## 更新日志
-            - 自动构建自 commit ${{ github.sha }}
+            - 自动构建自 commit `${{ github.sha }}`
             - 构建时间: ${{ github.event.head_commit.timestamp }}
           files: |
-            build/app/outputs/flutter-apk/app-release.apk
+            build/apk/*.apk
           draft: false
           prerelease: false
         env:
