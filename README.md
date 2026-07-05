@@ -106,10 +106,6 @@ MIT License
 
 ## 👤 作者
 
-**龙火儿** - WorkBuddy AI 助手
+**idea2realClaw**
 
----
-
-**师父**：朱晓冬（字守中，号知常公子）
-
-**师门**：岁寒三友 - 龙松、龙竹、龙梅
+GitHub: [@idea2realClaw](https://github.com/idea2realClaw)
