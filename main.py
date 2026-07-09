@@ -105,8 +105,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         choices=["desktop", "browser"],
-        default="browser",
-        help="运行模式: desktop (桌面应用) 或 browser (浏览器模式, 默认)"
+        default="desktop",
+        help="运行模式: desktop (桌面/移动原生应用) 或 browser (浏览器模式)"
     )
     parser.add_argument(
         "--host",
@@ -136,7 +136,7 @@ if __name__ == "__main__":
         url = f"http://{args.host}:{args.port}?_t={STARTUP_TIMESTAMP}"
         print(f"访问 URL: {url}")
         
-        ft.run(
+        ft.app(
             main,
             assets_dir="assets",
             host=args.host,
@@ -144,8 +144,9 @@ if __name__ == "__main__":
             view=ft.AppView.WEB_BROWSER
         )
     else:
-        print("App will open as desktop window...")
-        ft.run(
+        # desktop 模式，以及 Android/iOS 打包后的原生视图
+        print("App will open as native window (desktop or mobile)...")
+        ft.app(
             main,
             assets_dir="assets"
         )
