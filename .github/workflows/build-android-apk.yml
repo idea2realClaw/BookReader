@@ -9,6 +9,8 @@ jobs:
   build-android:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: write   # 允许 GITHUB_TOKEN 创建 Release（修复 403）
 
     steps:
       - name: Checkout code
