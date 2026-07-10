@@ -84,11 +84,12 @@ def main(page: ft.Page):
 
     # 添加到页面：
     # - SafeArea 避让安卓状态栏/刘海（桌面端无影响）
-    # - minimum 额外上下各留 50px，缩短整体可用高度，避免顶/底贴边
+    # - minimum_padding 额外上下各留 50px，缩短整体可用高度，避免顶/底贴边
+    #   注意：flet 0.85.3 的 SafeArea 参数名为 minimum_padding（新版才叫 minimum）
     page.add(
         ft.SafeArea(
             content=main_window,
-            minimum=ft.Padding(top=50, right=0, bottom=50, left=0),
+            minimum_padding=ft.Padding(top=50, right=0, bottom=50, left=0),
         )
     )
 
