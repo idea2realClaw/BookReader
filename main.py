@@ -3,6 +3,7 @@
 """
 import flet as ft
 import time
+from version import APP_VERSION
 from ui.bookshelf import BookShelf
 from ui.log_window import LogWindow
 
@@ -59,7 +60,7 @@ class MainWindow(ft.Column):
         self.log_window.cleanup()
 
 
-VERSION = "1.0.3"  # 版本号（每次重启修改此版本号）
+VERSION = APP_VERSION  # 版本号（由 version.py 提供，构建时由 release 版本注入）
 
 def main(page: ft.Page):
     """主应用入口"""
@@ -81,8 +82,15 @@ def main(page: ft.Page):
     # 创建主窗口
     main_window = MainWindow(page)
 
-    # 添加到页面（用 SafeArea 避让安卓状态栏/刘海，桌面端无影响）
-    page.add(ft.SafeArea(content=main_window))
+    # 添加到页面：
+    # - SafeArea 避让安卓状态栏/刘海（桌面端无影响）
+    # - minimum 额外上下各留 50px，缩短整体可用高度，避免顶/底贴边
+    page.add(
+        ft.SafeArea(
+            content=main_window,
+            minimum=ft.Padding(top=50, right=0, bottom=50, left=0),
+        )
+    )
 
     # 保存引用以便清理
     page.main_window = main_window

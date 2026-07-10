@@ -5,7 +5,7 @@ import json
 import os
 import re
 from reader import open_book, BookReader
-from ui.tts import TTSEngine
+from ui.tts import TTSEngine, estimate_duration
 
 BOOKS_JSON_PATH = os.path.expanduser("~/.bookreader/books.json")
 
@@ -243,6 +243,14 @@ class BookViewer(ft.Container):
             # 在后台任务中朗读
             asyncio.create_task(self._read_all())
 
+    async def _wait_for(self, seconds: float):
+        """等待 seconds 秒，但随时可被停止事件中断。"""
+        step = 0.1
+        elapsed = 0.0
+        while elapsed < seconds and not self._tts_stop_event.is_set():
+            await asyncio.sleep(step)
+            elapsed += step
+
     async def _read_all(self):
         """从当前页开始朗读，自动翻页"""
         while self._is_reading and not self._tts_stop_event.is_set():
@@ -261,18 +269,25 @@ class BookViewer(ft.Container):
 
                 print(f"[BookViewer] 朗读第{self.current+1}页")
 
-                # 按句子朗读
+                # 按句子拆分（用于逐句高亮）
                 sentences = self._split_into_sentences(text)
-                for i, sentence in enumerate(sentences):
+                durations = [estimate_duration(s) for s in sentences]
+
+                # 整页一次性朗读（安卓端只会触发一次系统播放器，避免每句弹窗）
+                speak_task = asyncio.create_task(self._speak_text(text))
+
+                # 按估算时长逐句高亮，与朗读节奏大致同步
+                for i, d in enumerate(durations):
                     if self._tts_stop_event.is_set():
-                        print(f"[BookViewer] 朗读被停止")
                         break
-
-                    # 高亮当前句子
                     await self._highlight_sentence(i)
+                    await self._wait_for(d)
 
-                    # 朗读当前句子
-                    await self._speak_text(sentence)
+                # 等待整页朗读结束
+                try:
+                    await speak_task
+                except Exception as ex:
+                    print(f"[BookViewer] 朗读任务异常: {ex}")
 
                 if self._tts_stop_event.is_set():
                     break

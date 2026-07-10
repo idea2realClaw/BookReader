@@ -3,6 +3,7 @@ import asyncio
 import json
 import datetime
 import flet as ft
+from version import APP_VERSION
 from reader import open_book
 from ui.book_viewer import BookViewer
 
@@ -48,7 +49,7 @@ class BookShelf(ft.Container):
                 ft.Container(
                     content=ft.Row(
                         [
-                            ft.Text("我的书架", size=20, weight=ft.FontWeight.BOLD),
+                            ft.Text(f"我的书架 v{APP_VERSION}", size=20, weight=ft.FontWeight.BOLD),
                             ft.Row(
                                 [
                                     ft.IconButton(

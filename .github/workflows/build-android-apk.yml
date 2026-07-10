@@ -56,6 +56,12 @@ jobs:
             echo "version=1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Bake version into source
+        # 把 release 版本号写入 version.py，使 APK 内显示正确的版本
+        run: |
+          printf 'APP_VERSION = "%s"\n' "${{ steps.ver.outputs.version }}" > version.py
+          echo "Baked APP_VERSION=${{ steps.ver.outputs.version }}"
+
       - name: Build APK
         # --yes 触发 assume_yes，让 flet 自动安装 Flutter/Android SDK 而不弹交互提示
         run: |

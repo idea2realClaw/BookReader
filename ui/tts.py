@@ -30,6 +30,11 @@ def _detect_lang(text: str) -> str:
     return "en"
 
 
+def estimate_duration(text: str) -> float:
+    """公开：估算朗读时长（秒），供调用方做逐句高亮节奏控制。"""
+    return _estimate_duration(text)
+
+
 def _estimate_duration(text: str) -> float:
     """估算朗读时长（秒）。中文约 6 字/秒，英文约 12 词/秒。"""
     if _CJK_RE.search(text):
@@ -43,6 +48,7 @@ class TTSEngine:
     def __init__(self, page=None):
         self.page = page
         self._process = None
+        self._httpd = None  # 安卓本地 HTTP 服务（播放用）
 
     # ---- 平台判断 ----
     def _is_windows(self) -> bool:
@@ -131,18 +137,79 @@ class TTSEngine:
             return duration
 
         try:
-            self._launch_player(mp3_path)
+            if self._is_mobile():
+                # 安卓：经本地 HTTP 服务交给系统播放器。
+                # 直接 file:// 受 scoped storage 限制无法被其他应用读取，
+                # 走 http://127.0.0.1 可绕开该限制（无需 INTERNET 权限）。
+                self._play_via_local_server(mp3_path)
+            else:
+                self._launch_player(mp3_path)
         except Exception as ex:
             print(f"[TTS] 播放启动失败: {ex}")
 
         await self._wait(duration, stop_event)
 
+        # 清理：关闭本地服务并删除临时文件
+        self._shutdown_server()
         try:
             if mp3_path and os.path.exists(mp3_path):
                 os.unlink(mp3_path)
         except Exception:
             pass
         return duration
+
+    def _play_via_local_server(self, mp3_path: str):
+        """安卓：起一个本地 HTTP 服务托管 mp3，再让系统播放器打开该 URL。"""
+        import http.server
+        import socketserver
+        import socket
+        import functools
+        import threading
+
+        directory = os.path.dirname(mp3_path)
+        fname = os.path.basename(mp3_path)
+        try:
+            os.chmod(mp3_path, 0o644)
+        except Exception:
+            pass
+
+        class _SilentHandler(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        handler = functools.partial(_SilentHandler, directory=directory)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        httpd = socketserver.TCPServer(("127.0.0.1", port), handler)
+        self._httpd = httpd
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+        url = f"http://127.0.0.1:{port}/{fname}"
+        self._process = subprocess.Popen(
+            [
+                "am", "start",
+                "-a", "android.intent.action.VIEW",
+                "-t", "audio/mpeg",
+                "-d", url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"[TTS] 安卓播放 URL: {url}")
+
+    def _shutdown_server(self):
+        httpd = self._httpd
+        self._httpd = None
+        if httpd is None:
+            return
+        try:
+            httpd.shutdown()
+            httpd.server_close()
+        except Exception:
+            pass
 
     def _launch_player(self, mp3_path: str):
         if self._is_mobile():
@@ -188,6 +255,7 @@ class TTSEngine:
 
     def _stop_process(self):
         p = self._process
+        self._process = None
         if p is None:
             return
         try:
@@ -199,4 +267,5 @@ class TTSEngine:
                     p.kill()
         except Exception:
             pass
-        self._process = None
+        # 同时关闭安卓本地 HTTP 服务（停止后不再提供音频流）
+        self._shutdown_server()
