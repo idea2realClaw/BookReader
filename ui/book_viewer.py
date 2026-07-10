@@ -5,6 +5,7 @@ import json
 import os
 import re
 from reader import open_book, BookReader
+from ui.tts import TTSEngine
 
 BOOKS_JSON_PATH = os.path.expanduser("~/.bookreader/books.json")
 
@@ -25,6 +26,7 @@ class BookViewer(ft.Container):
         self._sentence_controls = []
         self._tts_engine = None
         self._tts_process = None  # 保存TTS进程
+        self.tts = TTSEngine(self.ft_page)  # 跨平台 TTS 引擎
 
         # 页面文本容器（按句子显示，支持高亮）
         self.page_column = ft.Column(
@@ -305,73 +307,19 @@ class BookViewer(ft.Container):
         self._save_position()
 
     async def _speak_text(self, text: str):
-        """使用TTS朗读文本（支持停止）"""
+        """使用跨平台 TTS 朗读文本（支持停止）
+
+        - Windows 桌面：系统 SAPI（离线）
+        - 其它平台（含安卓）：gTTS 在线合成 + 尝试播放
+        """
         if not text:
             return
 
         print(f"[BookViewer] TTS朗读: {len(text)} 字符")
-
-        if self.ft_page.web:
-            # 浏览器模式：使用Web Speech API
-            await asyncio.sleep(len(text) / 10)  # 模拟朗读时间
-        else:
-            # 桌面模式：使用独立进程运行TTS（避免崩溃）
-            try:
-                await asyncio.to_thread(self._speak_with_process, text)
-            except Exception as ex:
-                print(f"[BookViewer] TTS错误: {ex}")
-                await asyncio.sleep(1)
-
-    def _speak_with_process(self, text: str):
-        """使用独立进程朗读（支持停止）"""
         try:
-            import subprocess
-            import tempfile
-            import os
-            import time
-
-            # 限制文本长度
-            text = text[:200]
-
-            # 创建VBScript
-            vbs_script = f'''Set speak = CreateObject("SAPI.SpVoice")
-speak.Rate = 2
-speak.Speak "{text.replace(chr(34), "'").replace(chr(10), " ").replace(chr(13), " ")}"
-'''
-
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.vbs', encoding='ansi') as f:
-                f.write(vbs_script)
-                vbs_path = f.name
-
-            # 启动进程
-            self._tts_process = subprocess.Popen(
-                ['cscript', '//nologo', vbs_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-
-            # 等待进程完成或停止事件
-            while self._tts_process.poll() is None:
-                if self._tts_stop_event.is_set():
-                    print(f"[BookViewer] 停止TTS进程")
-                    self._tts_process.terminate()
-                    try:
-                        self._tts_process.wait(timeout=1)
-                    except:
-                        self._tts_process.kill()
-                    break
-                time.sleep(0.1)
-
-            # 清理临时文件
-            try:
-                os.unlink(vbs_path)
-            except:
-                pass
-
-            self._tts_process = None
-
-        except Exception as e:
-            print(f"[BookViewer] TTS进程错误: {e}")
+            await self.tts.speak(text, self._tts_stop_event)
+        except Exception as ex:
+            print(f"[BookViewer] TTS错误: {ex}")
             import traceback
             traceback.print_exc()
 

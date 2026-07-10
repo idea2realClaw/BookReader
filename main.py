@@ -80,10 +80,10 @@ def main(page: ft.Page):
     
     # 创建主窗口
     main_window = MainWindow(page)
-    
-    # 添加到页面
-    page.add(main_window)
-    
+
+    # 添加到页面（用 SafeArea 避让安卓状态栏/刘海，桌面端无影响）
+    page.add(ft.SafeArea(content=main_window))
+
     # 保存引用以便清理
     page.main_window = main_window
     
