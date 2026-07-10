@@ -70,27 +70,43 @@ class BookViewer(ft.Container):
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
         )
 
+        # 翻页/朗读栏：用 Stack 绝对定位，钉在浮动日志窗口上方（避免被日志盖住）
+        self.nav_row = ft.Row(
+            [
+                ft.IconButton(ft.Icons.CHEVRON_LEFT, on_click=self.prev_page, icon_size=40),
+                self.read_btn,
+                ft.Container(content=self.page_label, alignment=ft.Alignment.CENTER, expand=True),
+                ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=self.next_page, icon_size=40),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            height=56,
+        )
+        # flet 0.85.3：直接给 Stack 子控件设 left/right/bottom 定位（无 Positioned 包装类）
+        self.nav_row.left = 0
+        self.nav_row.right = 0
+        self.nav_row.bottom = 10  # 初始值，set_log_gap 会更新为 gap + 10
+
+        # 文本滚动区：上下左右贴边；底部预留出 nav_row + 日志高度，避免被遮挡或过长
+        self.text_container = ft.Container(
+            content=self.page_column,
+            padding=ft.Padding(left=80, top=30, right=80, bottom=30),
+        )
+        self.text_container.top = 0
+        self.text_container.left = 0
+        self.text_container.right = 0
+        self.text_container.bottom = 70  # 初始值，set_log_gap 会更新
+
+        # 阅读区主体：header 在顶部固定，body 为 Stack（文本层 + 浮动的翻页/朗读栏）
+        self.body = ft.Stack(expand=True)
+        self.body.controls = [self.text_container, self.nav_row]
+
         self.content = ft.Column(
             [
                 self.header,
-                ft.Container(
-                    content=self.page_column,
-                    expand=True,
-                    padding=ft.Padding(left=80, top=30, right=80, bottom=30),
-                ),
-                ft.Row(
-                    [
-                        ft.IconButton(ft.Icons.CHEVRON_LEFT, on_click=self.prev_page, icon_size=40),
-                        self.read_btn,
-                        ft.Container(content=self.page_label, alignment=ft.Alignment.CENTER, expand=True),
-                        ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=self.next_page, icon_size=40),
-                    ],
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                ),
+                self.body,
             ],
             spacing=0,
             expand=True,
-            alignment=ft.MainAxisAlignment.START,
         )
 
         # 加载保存的位置
@@ -99,13 +115,23 @@ class BookViewer(ft.Container):
         self.ft_page.on_resize = self._on_resize
 
     def set_log_gap(self, gap: int):
-        """把翻页栏抬到浮动日志窗口上方，避免被日志盖住、文本区也不会过长。
+        """把翻页/朗读栏钉在浮动日志窗口上方 10px（gap = 当前日志窗口高度）。
 
-        gap = 当前日志窗口高度。日志浮在底部且向上展开，翻页栏需要留在日志
-        顶边之上；日志展开/折叠时 MainWindow 会回调此方法更新位置。
+        使用 Stack 绝对定位（flet 0.85.3 给子控件设 left/right/bottom）：
+        - nav_row.bottom = gap + 10  → 整排按钮完全位于日志顶边之上 10px，
+          不再进入日志的覆盖区（之前用列 padding 会让按钮下半截被日志盖住）。
+        - text_container.bottom = gap + 10 + nav 高度 + 余量 → 文本区下移，
+          既不钻到按钮下面，也不会因日志展开而过长。
+        日志展开/折叠时 MainWindow 会回调此方法更新位置。
         """
-        # 给整个内容列底部留白 = 日志高度，翻页栏(最后一行)自然落在日志上方
-        self.content.padding = ft.Padding(left=0, top=0, right=0, bottom=gap)
+        nav_height = 56
+        self.nav_row.bottom = gap + 10
+        self.text_container.bottom = gap + 10 + nav_height + 16  # +16 为安全余量
+        self.nav_row.left = 0
+        self.nav_row.right = 0
+        self.text_container.left = 0
+        self.text_container.right = 0
+        self.text_container.top = 0
         try:
             self.ft_page.update()
         except Exception:
