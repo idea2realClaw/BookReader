@@ -82,16 +82,14 @@ def main(page: ft.Page):
     # 创建主窗口
     main_window = MainWindow(page)
 
-    # 添加到页面：
-    # - SafeArea 避让安卓状态栏/刘海（桌面端无影响）
-    # - minimum_padding 额外上下各留 50px，缩短整体可用高度，避免顶/底贴边
-    #   注意：flet 0.85.3 的 SafeArea 参数名为 minimum_padding（新版才叫 minimum）
-    page.add(
-        ft.SafeArea(
-            content=main_window,
-            minimum_padding=ft.Padding(top=50, right=0, bottom=50, left=0),
-        )
-    )
+    # 上下各留 50px 边距（满足"缩短整体高度、避让状态栏"的需求）。
+    # 注意：之前用 SafeArea(minimum_padding=...) 会吃掉底部可用高度且
+    # 在 flet 0.85.3 下不向子控件传递紧约束高度，导致底部日志窗 / 翻页键 /
+    # TTS 键被裁出屏幕。改用 page.padding：page.add 一定会给直接子控件
+    # 一个"撑满剩余区域"的紧约束，内容精确适配、永不裁切。
+    page.padding = ft.Padding(top=50, right=0, bottom=50, left=0)
+
+    page.add(main_window)
 
     # 保存引用以便清理
     page.main_window = main_window
