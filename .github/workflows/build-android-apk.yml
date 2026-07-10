@@ -64,6 +64,7 @@ jobs:
 
       - name: Build APK
         # --yes 触发 assume_yes，让 flet 自动安装 Flutter/Android SDK 而不弹交互提示
+        # assets/icon.png 和 assets/icon_android.png 会被 flet 自动识别为应用图标
         run: |
           cd "${{ github.workspace }}"
           flet build apk \
@@ -73,6 +74,7 @@ jobs:
             --description "A simple and elegant eBook reader" \
             --build-number "${{ github.run_number }}" \
             --build-version "${{ steps.ver.outputs.version }}" \
+            --android-adaptive-icon-background "#1565C0" \
             --skip-flutter-doctor \
             --yes
 
