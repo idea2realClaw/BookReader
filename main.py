@@ -8,38 +8,57 @@ from ui.bookshelf import BookShelf
 from ui.log_window import LogWindow
 
 
-class MainWindow(ft.Column):
-    """主窗口：包含内容区域和可折叠的日志窗口"""
+class MainWindow(ft.Stack):
+    """主窗口：内容区(书架/阅读器)铺满固定高度，日志窗口浮于底部并向上展开。
+
+    布局要点（解决"日志盖住翻页键 / 书架被压缩"的问题）：
+    - 内容区(书架或阅读器)用 top/left/right/bottom=0 铺满整个 Stack，高度固定 = 屏幕可用高度。
+    - 日志窗口设 left/right=0、bottom=0 浮在内容之上（flet 0.85.3 直接给子控件设这些属性定位）：
+        * 折叠时只显示 40px 标题栏，书架完整可见(= 屏幕高度 - 50px)；
+        * 展开时高度变 200px 且 bottom 锚定不动，故"向上展开、底部不动"。
+    - 阅读器通过 set_log_gap() 把翻页栏抬到日志上方，文本区不会过长也不被遮挡。
+    """
     
     def __init__(self, page: ft.Page):
-        super().__init__(expand=True, spacing=0)
+        super().__init__(expand=True)
         
         self.ft_page = page
+        self.active_viewer = None
+        self.log_height = 40  # 日志折叠态默认高度
         
-        # 创建日志窗口
+        # 日志窗口（浮于底部，向上展开；默认折叠）
         self.log_window = LogWindow(page, max_height=200)
+        self.log_window.on_toggle = self._on_log_toggle
         
         # 创建书架（主内容）
         self.bookshelf = BookShelf(self)
-        
-        # 创建内容容器（用于切换内容）
-        self.content_container = ft.Container(
-            content=self.bookshelf,
-            expand=True,
-        )
-        
-        # 创建分隔线
-        self.divider = ft.Divider(height=2, color=ft.Colors.GREY_300)
-        
-        # 主布局
+
+        # 内容容器：铺满整个 Stack（书架/阅读器都在这里切换）。
+        # flet 0.85.3 没有 Positioned 包装类，直接给 Stack 子控件设
+        # top/left/right/bottom 即可定位（来自 LayoutControl）。
+        self.content_container = ft.Container(content=self.bookshelf)
+        self.content_container.top = 0
+        self.content_container.left = 0
+        self.content_container.right = 0
+        self.content_container.bottom = 0
+
+        # 日志窗口：左/右贴边、bottom 锚定在 Stack 底部；不设 top，
+        # 高度由其自身 height(40/200) 决定，展开时"向上生长、底部不动"。
+        self.log_window.left = 0
+        self.log_window.right = 0
+        self.log_window.bottom = 0
+
+        # 主布局：内容铺底，日志浮顶（Stack 中靠后的控件渲染在上层）
         self.controls = [
             self.content_container,
-            self.divider,
             self.log_window,
         ]
         
         # 设置日志捕获
         self.log_window.setup_log_capture()
+        # 同步初始日志高度（默认折叠 40px）；此处仅记录高度，不触发 update
+        # （MainWindow 尚未挂到 page，update 在 __init__ 阶段不安全）
+        self.log_height = self.log_window.height
         
         print("[MainWindow] 主窗口已初始化")
     
@@ -47,12 +66,24 @@ class MainWindow(ft.Column):
         """导航到书籍阅读器"""
         print(f"[MainWindow] 导航到阅读器")
         self.content_container.content = viewer
+        self.active_viewer = viewer
+        # 让阅读器的翻页栏抬到当前日志高度之上
+        if hasattr(viewer, "set_log_gap"):
+            viewer.set_log_gap(self.log_height)
         self.ft_page.update()
     
     def navigate_to_shelf(self):
         """导航回书架"""
         print(f"[MainWindow] 导航回书架")
         self.content_container.content = self.bookshelf
+        self.active_viewer = None
+        self.ft_page.update()
+    
+    def _on_log_toggle(self, height):
+        """日志展开/折叠时：记录高度，并让正在阅读的阅读器把翻页栏抬到日志上方。"""
+        self.log_height = height
+        if self.active_viewer and hasattr(self.active_viewer, "set_log_gap"):
+            self.active_viewer.set_log_gap(height)
         self.ft_page.update()
     
     def cleanup(self):

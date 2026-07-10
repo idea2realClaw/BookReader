@@ -112,8 +112,9 @@ class LogWindow(ft.Container):
         super().__init__()
         self.ft_page = page
         self.max_height = max_height
-        self.is_collapsed = False
+        self.is_collapsed = True  # 默认折叠：书架完整可见
         self.log_capture = None
+        self.on_toggle = None  # 折叠/展开时回调 MainWindow，参数为当前高度
         
         # 日志显示区域（使用 TextField 支持多行选择）
         self.log_text = ft.TextField(
@@ -181,7 +182,7 @@ class LogWindow(ft.Container):
         )
         
         self.expand = False
-        self.height = max_height
+        self.height = 40  # 折叠态默认只显示标题栏
         self.padding = 10
         self.bgcolor = ft.Colors.WHITE
         self.border = ft.Border(
@@ -190,6 +191,11 @@ class LogWindow(ft.Container):
             right=ft.BorderSide(1, ft.Colors.GREY_300),
             bottom=ft.BorderSide(1, ft.Colors.GREY_300),
         )
+
+        # 默认折叠态：隐藏日志正文，仅保留标题栏
+        self.log_container.visible = False
+        self.toggle_btn.icon = ft.Icons.EXPAND_MORE
+        self.toggle_btn.tooltip = "展开日志"
     
     def _toggle_collapse(self, e):
         """切换折叠状态"""
@@ -200,13 +206,17 @@ class LogWindow(ft.Container):
             self.log_container.visible = False
             self.height = 40
             self.toggle_btn.icon = ft.Icons.EXPAND_MORE
-            self.toggle_btn.tooltip = "展开日志窗口"
+            self.toggle_btn.tooltip = "展开日志"
         else:
-            # 展开
+            # 展开（向上展开，bottom 锚点不动）
             self.log_container.visible = True
             self.height = self.max_height
             self.toggle_btn.icon = ft.Icons.EXPAND_LESS
-            self.toggle_btn.tooltip = "折叠日志窗口"
+            self.toggle_btn.tooltip = "折叠日志"
+        
+        # 通知主窗口：日志高度变化，让阅读器把翻页栏抬到日志上方
+        if self.on_toggle:
+            self.on_toggle(self.height)
         
         self.ft_page.update()
     

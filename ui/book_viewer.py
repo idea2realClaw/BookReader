@@ -98,6 +98,19 @@ class BookViewer(ft.Container):
         self._update_page_display()
         self.ft_page.on_resize = self._on_resize
 
+    def set_log_gap(self, gap: int):
+        """把翻页栏抬到浮动日志窗口上方，避免被日志盖住、文本区也不会过长。
+
+        gap = 当前日志窗口高度。日志浮在底部且向上展开，翻页栏需要留在日志
+        顶边之上；日志展开/折叠时 MainWindow 会回调此方法更新位置。
+        """
+        # 给整个内容列底部留白 = 日志高度，翻页栏(最后一行)自然落在日志上方
+        self.content.padding = ft.Padding(left=0, top=0, right=0, bottom=gap)
+        try:
+            self.ft_page.update()
+        except Exception:
+            pass
+
     def _split_into_sentences(self, text: str):
         """将文本分割成句子"""
         if not text:
