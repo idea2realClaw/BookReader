@@ -1,17 +1,15 @@
 """
-跨平台 TTS 引擎（统一走 gTTS 在线合成）。
+跨平台 TTS 引擎（基于 Edge TTS，应用内播放）。
 
-- 桌面端（Windows / Linux / macOS）与移动端（Android / iOS）均使用 gTTS 在线合成 mp3。
-- 合成域名优先使用 .cn（translate.google.cn），若不可用（接口返回 404）则自动回退 .com
-  （translate.google.com），二者在中国大陆均可访问，保证国内可用。
-- 桌面端：合成后直接用系统播放器（Windows: 关联播放器 / macOS: afplay / Linux: paplay/aplay）
-  同步播放，播完再翻页；停止时杀掉播放器进程即可中断。
-- 移动端（安卓）：受 scoped storage 限制，纯 Python 无法可靠地把应用私有目录音频交给系统
-  播放器，因此经本地 HTTP 服务（127.0.0.1，绕开 scoped storage，无需 INTERNET 权限）交给
-  系统播放器播放；若合成失败则按估算时长静默停顿，保证朗读节奏正常（不会瞬间翻页）。
-
-说明：移动端"稳定、应用内可停止的原生朗读"需要 Flutter 原生 flutter_tts 控件（自定义 Dart
-桥接），纯 Python 方案为尽力而为。桌面端用系统播放器同步播放，停止可靠。
+- 合成：Edge TTS（微软在线语音），免费、支持中文男女声、可调语速、在中国大陆可访问。
+  - 男声默认：zh-CN-YunyangNeural；女声默认：zh-CN-XiaoxiaoNeural。
+  - 语速通过 Edge TTS 的 rate 参数控制（如 +20%），中英文本自动选对应语音。
+- 桌面端（Windows / macOS / Linux）：用 pygame 在应用内播放合成出的 mp3，
+  不调用任何外部播放器（如 vlc）；语速滑块通过 pygame 播放频率即时生效。
+- 移动端（Android）：受 scoped storage 限制，纯 Python 无法可靠地把应用私有目录音频
+  交给系统播放器，因此经本地 HTTP 服务（127.0.0.1，绕开 scoped storage，无需 INTERNET
+  权限）交给系统播放器播放；语速已烘焙进 mp3（Edge TTS rate），系统播放器按原速播放即可。
+- 若 Edge TTS 合成失败（无网络等），按估算时长静默停顿，保证朗读节奏正常（不会瞬间翻页）。
 """
 
 import asyncio
@@ -23,14 +21,26 @@ import tempfile
 import threading
 import time
 
+import edge_tts
+
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+# 音色映射：男 / 女（缺省男）。每种语言给出 Edge TTS 标准神经语音。
+VOICE_MAP = {
+    "male": {
+        "zh": "zh-CN-YunyangNeural",      # 云扬（男）
+        "en": "en-US-GuyNeural",          # Guy（男）
+    },
+    "female": {
+        "zh": "zh-CN-XiaoxiaoNeural",     # 晓晓（女）
+        "en": "en-US-AriaNeural",         # Aria（女）
+    },
+}
 
 
 def _detect_lang(text: str) -> str:
-    """简易语言检测：含中文用 zh-cn，否则 en。"""
-    if _CJK_RE.search(text):
-        return "zh-cn"
-    return "en"
+    """简易语言检测：含中文用 zh，否则 en。"""
+    return "zh" if _CJK_RE.search(text) else "en"
 
 
 def estimate_duration(text: str) -> float:
@@ -39,7 +49,7 @@ def estimate_duration(text: str) -> float:
 
 
 def _estimate_duration(text: str) -> float:
-    """估算朗读时长（秒）。中文约 6 字/秒，英文约 12 词/秒。"""
+    """估算朗读时长（秒）。中文约 6 字/秒，英文约 2.5 词/秒（含 Edge TTS 语速后略调）。"""
     if _CJK_RE.search(text):
         chars = len(_CJK_RE.findall(text))
         return max(1.0, chars / 6.0)
@@ -47,19 +57,20 @@ def _estimate_duration(text: str) -> float:
     return max(1.0, words / 2.5)
 
 
+def _rate_string(speed: float) -> str:
+    """将倍速（>=1.0）转换为 Edge TTS rate 参数（如 +20%）。"""
+    pct = int(round((max(1.0, speed) - 1.0) * 100))
+    return f"+{pct}%"
+
+
 class TTSEngine:
     def __init__(self, page=None):
         self.page = page
         self._process = None
         self._httpd = None
-        self.speed = 1.0  # 朗读倍速（gTTS 在线合成不直接支持倍速，仅作预留）
-        self._stop_event = None  # 当前朗读会话的停止事件（供回调使用）
-
-    # 合成域名优先级：优先 .com.cn（面向中国大陆，需在境内网络可用），
-    # 不可达时回退 .com（同样在中国大陆可达）。gTTS 自 2.1.0 起支持 tld 参数。
-    # 注意：gTTS 不支持 tld='cn'（translate.google.cn 合成接口返回 404），
-    # 故用 'com.cn' 而非 'cn'。
-    _TTS_TLDS = ("com.cn", "com")
+        self.speed = 1.2        # 朗读倍速（1.0~2.0）
+        self.voice = "male"     # 音色：male / female（缺省男）
+        self._stop_event = None
 
     # ---- 平台判断 ----
     def _is_mobile(self) -> bool:
@@ -68,6 +79,10 @@ class TTSEngine:
         except Exception:
             return False
 
+    def _voice_id(self, text: str) -> str:
+        lang = _detect_lang(text)
+        return VOICE_MAP.get(self.voice, VOICE_MAP["male"]).get(lang, VOICE_MAP["male"]["zh"])
+
     # ---- 公开接口 ----
     async def speak(self, text: str, stop_event) -> float:
         """朗读 text，返回估算时长（秒）。stop_event 置位时尽快停止。"""
@@ -75,128 +90,127 @@ class TTSEngine:
         if not text:
             return 0.0
         self._stop_event = stop_event
-        # 桌面端与移动端统一走 gTTS 在线合成
-        return await self._speak_gtts(text, stop_event)
 
-    def stop(self):
-        # 停止系统播放器进程 / 关闭安卓本地 HTTP 服务
-        self._stop_process()
-
-    # ---- 在线合成：gTTS ----
-    async def _speak_gtts(self, text: str, stop_event) -> float:
         duration = _estimate_duration(text)
-        try:
-            from gtts import gTTS
-        except Exception as ex:
-            print(f"[TTS] gtts 不可用: {ex}，仅按节奏停顿")
-            await self._wait(duration, stop_event)
-            return duration
-
-        mp3_path = None
-        try:
-            fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-            lang = _detect_lang(text)
-            # 优先 .cn，失败自动回退 .com（均在中国大陆可达）
-            saved = None
-            for tld in self._TTS_TLDS:
-                try:
-                    gTTS(text=text, lang=lang, tld=tld).save(mp3_path)
-                    saved = tld
-                    break
-                except Exception as ex:
-                    print(f"[TTS] gTTS 合成失败(translate.google.{tld}): {ex}")
-            if saved is None:
-                print(f"[TTS] gTTS 全部域名合成失败（可能无网络），仅按节奏停顿")
-                await self._wait(duration, stop_event)
-                return duration
-            print(f"[TTS] gTTS 合成成功(tld={saved}, lang={lang})")
-        except Exception as ex:
-            print(f"[TTS] gTTS 合成异常（可能无网络）: {ex}")
+        # 合成 mp3（Edge TTS）
+        mp3_path = await self._synthesize(text)
+        if mp3_path is None:
+            # 合成失败：仅按节奏停顿
             await self._wait(duration, stop_event)
             return duration
 
         try:
             if self._is_mobile():
-                # 安卓：经本地 HTTP 服务交给系统播放器（绕开 scoped storage）
                 self._play_via_local_server(mp3_path)
+                await self._wait(duration, stop_event)
             else:
-                # 桌面：用系统播放器同步播放（播完再翻页，停止可靠）
-                self._launch_and_wait_player(mp3_path, stop_event, duration)
-        except Exception as ex:
-            print(f"[TTS] 播放启动失败: {ex}")
-            await self._wait(duration, stop_event)
-
-        # 清理：关闭安卓本地服务并删除临时文件
-        self._shutdown_server()
-        try:
-            if mp3_path and os.path.exists(mp3_path):
-                os.unlink(mp3_path)
-        except Exception:
-            pass
+                await self._play_pygame(mp3_path, stop_event, duration)
+        finally:
+            self._shutdown_server()
+            try:
+                if mp3_path and os.path.exists(mp3_path):
+                    os.unlink(mp3_path)
+            except Exception:
+                pass
         return duration
 
-    def _launch_and_wait_player(self, mp3_path: str, stop_event, duration: float):
-        """桌面端：启动系统播放器并同步等待播放结束（或停止信号）。"""
-        if sys.platform == "win32":
-            # os.startfile 为同步阻塞（直到关联的播放器关闭）
-            self._process = ("startfile", mp3_path)
-            try:
-                os.startfile(mp3_path)  # type: ignore[attr-defined]
-            except Exception as ex:
-                print(f"[TTS] Windows 启动播放器失败: {ex}")
-                self._process = None
-        elif sys.platform == "darwin":
-            self._process = subprocess.Popen(
-                ["afplay", mp3_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        else:
-            # Linux：优先 paplay/aplay（同步播放、可终止），否则回退 xdg-open
-            player = None
-            for cand in ("paplay", "aplay", "mpg123", "play"):
-                if self._which(cand):
-                    player = cand
-                    break
-            if player:
-                self._process = subprocess.Popen(
-                    [player, mp3_path],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            else:
-                self._process = subprocess.Popen(
-                    ["xdg-open", mp3_path],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
+    def stop(self):
+        # 桌面端：停止 pygame 播放；移动端：关闭本地 HTTP 服务与系统播放器
+        self._stop_pygame()
+        self._stop_process()
+        self._shutdown_server()
 
-        # 同步等待：播放器进程结束，或收到停止信号
-        if isinstance(self._process, tuple) and self._process[0] == "startfile":
-            # Windows os.startfile 已同步阻塞；只需等待停止信号
-            self._wait_sync(stop_event, duration)
-        else:
-            p = self._process
+    # ---- 合成（Edge TTS） ----
+    async def _synthesize(self, text: str) -> str | None:
+        voice = self._voice_id(text)
+        rate = _rate_string(self.speed)
+        try:
+            fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            comm = edge_tts.Communicate(text=text, voice=voice, rate=rate)
+            await comm.save(mp3_path)
+            print(f"[TTS] Edge TTS 合成成功 voice={voice} rate={rate}")
+            return mp3_path
+        except Exception as ex:
+            print(f"[TTS] Edge TTS 合成失败（可能无网络）: {ex}")
+            try:
+                if "mp3_path" in dir() and os.path.exists(mp3_path):
+                    os.unlink(mp3_path)
+            except Exception:
+                pass
+            return None
+
+    # ---- 桌面端：pygame 应用内播放（不调用外部播放器） ----
+    async def _play_pygame(self, mp3_path: str, stop_event, duration: float):
+        try:
+            import pygame
+        except Exception as ex:
+            print(f"[TTS] pygame 不可用: {ex}，仅按节奏停顿")
+            await self._wait(duration, stop_event)
+            return
+
+        try:
+            pygame.mixer.init()
+        except Exception as ex:
+            print(f"[TTS] pygame mixer 初始化失败: {ex}")
+            await self._wait(duration, stop_event)
+            return
+
+        try:
+            # 倍速：用略高的播放频率模拟（会伴随轻微音调升高，属淘宝语音式加速）。
+            # pygame 仅支持 22050/44100/48000，取最接近的合法值。
+            base = 44100
+            if self.speed > 1.02:
+                cand = [48000, 44100, 22050]
+                for f in cand:
+                    if f >= base * self.speed:
+                        freq = f
+                        break
+                else:
+                    freq = 48000
+                try:
+                    pygame.mixer.quit()
+                    pygame.mixer.init(frequency=freq)
+                except Exception:
+                    pass
+
+            try:
+                pygame.mixer.music.load(mp3_path)
+                pygame.mixer.music.play()
+            except Exception as ex:
+                print(f"[TTS] pygame 播放失败: {ex}")
+                return
+
+            # 等待播放结束或停止信号
             step = 0.1
             elapsed = 0.0
             while True:
                 if stop_event.is_set():
-                    self._stop_process()
+                    pygame.mixer.music.stop()
                     break
-                if p is None or p.poll() is not None:
+                if not pygame.mixer.music.get_busy():
                     break
                 if elapsed >= duration + 5.0:
-                    # 播放器异常未退出（如 xdg-open 仅拉起外部程序）：超时退出
-                    self._stop_process()
+                    pygame.mixer.music.stop()
                     break
-                time.sleep(step)
+                await asyncio.sleep(step)
                 elapsed += step
+        finally:
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
 
-    @staticmethod
-    def _which(name: str) -> bool:
-        from shutil import which
-        return which(name) is not None
+    def _stop_pygame(self):
+        try:
+            import pygame
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+        except Exception:
+            pass
 
+    # ---- 移动端：本地 HTTP 服务 + 系统播放器 ----
     def _play_via_local_server(self, mp3_path: str):
-        """安卓：起一个本地 HTTP 服务托管 mp3，再让系统播放器打开该 URL。"""
         import functools
         import http.server
         import socket
@@ -248,36 +262,22 @@ class TTSEngine:
             pass
 
     async def _wait(self, duration: float, stop_event):
-        """按估算时长等待（合成失败时的兜底停顿）。"""
         elapsed = 0.0
         step = 0.1
         while elapsed < duration:
             if stop_event.is_set():
+                self._stop_pygame()
                 self._stop_process()
                 break
             await asyncio.sleep(step)
             elapsed += step
+        self._stop_pygame()
         self._stop_process()
 
-    def _wait_sync(self, stop_event, duration: float):
-        """同步等待（Windows os.startfile 已阻塞，这里仅响应停止信号）。"""
-        elapsed = 0.0
-        step = 0.1
-        while elapsed < duration + 5.0:
-            if stop_event.is_set():
-                self._stop_process()
-                break
-            time.sleep(step)
-            elapsed += step
-
     def _stop_process(self):
-        # Windows os.startfile 无法终止外部播放器（进程句柄不可用），仅关闭安卓服务
         p = self._process
         self._process = None
         if p is None:
-            return
-        if isinstance(p, tuple):
-            # Windows startfile：记录的是 ('startfile', path)，无法直接终止
             return
         try:
             if p.poll() is None:
@@ -288,5 +288,4 @@ class TTSEngine:
                     p.kill()
         except Exception:
             pass
-        # 同时关闭安卓本地 HTTP 服务（停止后不再提供音频流）
         self._shutdown_server()

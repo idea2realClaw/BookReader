@@ -7,8 +7,8 @@ from version import APP_VERSION
 from reader import open_book
 from ui.book_viewer import BookViewer
 
-# 书籍数据持久化文件路径
-BOOKS_JSON_PATH = os.path.expanduser("~/.bookreader/books.json")
+# 书籍列表持久化文件路径（与阅读位置 books.json 分离，避免结构冲突互相覆盖）
+BOOKS_JSON_PATH = os.path.expanduser("~/.bookreader/shelf.json")
 
 
 class BookShelf(ft.Container):

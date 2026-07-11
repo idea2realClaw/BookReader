@@ -89,6 +89,19 @@ class BookViewer(ft.Container):
             on_change=self._on_speed,
         )
 
+        # 音色下拉（倍速右侧）：男 / 女，缺省男
+        self.voice_dd = ft.Dropdown(
+            label="音色",
+            value="male",
+            width=110,
+            text_size=12,
+            options=[
+                ft.dropdown.Option("male", "男声"),
+                ft.dropdown.Option("female", "女声"),
+            ],
+            on_change=self._on_voice,
+        )
+
         self.header = ft.Row(
             [
                 ft.IconButton(ft.Icons.ARROW_BACK, on_click=self._close),
@@ -129,6 +142,7 @@ class BookViewer(ft.Container):
                 self.read_btn,
                 self.speed_slider,
                 self.speed_label,
+                self.voice_dd,
                 ft.Container(content=self.page_label, alignment=ft.Alignment.CENTER, expand=True),
                 ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=self.next_page, icon_size=40),
             ],
@@ -400,6 +414,11 @@ class BookViewer(ft.Container):
         v = float(e.control.value)
         self.tts.speed = v
         self.speed_label.value = f"{v:.1f}x"
+        self.ft_page.update()
+
+    def _on_voice(self, e):
+        """音色下拉：更新 TTS 音色（下一次朗读生效）。"""
+        self.tts.voice = e.control.value or "male"
         self.ft_page.update()
 
     # ------------------------------------------------------------------
