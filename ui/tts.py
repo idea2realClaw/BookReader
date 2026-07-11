@@ -98,6 +98,8 @@ class TTSEngine:
         self.voice = "male"     # 音色：male / female（缺省男）
         self._stop_event = None
         self._audio = None  # flet_audio.Audio 控件（安卓端应用内播放，懒创建）
+        self._audio_just_registered = False  # 首次注册后给原生侧一点准备时间
+        self._play_lock = asyncio.Lock()  # 防止并发播放同一 audio 控件
         try:
             print(f"[TTS] 初始化：平台={'mobile' if self._is_mobile() else 'desktop'}，"
                   f"flet_audio={'可用' if _FTA is not None else '不可用(将回退系统播放器)'}")
@@ -179,9 +181,17 @@ class TTSEngine:
             pass
 
     def _get_flet_audio(self):
-        """懒创建并挂载一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。
-        返回 (audio, just_mounted)。首次挂载后需给原生控件一点注册时间再播放。"""
-        just_mounted = False
+        """懒创建并注册一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。
+        返回 audio。首次创建后需给原生控件一点注册时间再播放。
+
+        关键坑（Flet 0.85.3）：Audio 是 Service 子类，其 init() 会调用
+        context.page._services.register_service(self) 来注册到原生侧。
+        但 init() 在 __post_init__ 时执行，若不在 Flet 事件上下文里
+        （如在后台 asyncio task 中创建），context.page 会抛 RuntimeError
+        被静默吞掉 → service 永远不会注册到原生侧 → 后续 audio.play() 的
+        invoke_method 没有任何监听器响应 → 30 秒 TimeoutException。
+
+        修复：手动调用 page._services.register_service(audio) 注册。"""
         if self._audio is None:
             self._audio = _FTA.Audio(
                 src="",
@@ -190,12 +200,41 @@ class TTSEngine:
                 release_mode=_FTA.ReleaseMode.STOP,
             )
             try:
-                self.page.services.append(self._audio)
-                self.page.update()
-                just_mounted = True
+                # 正确注册方式：通过 page._services.register_service()
+                # （page.services.append() 只是把 audio 加到 View.services 列表，
+                #  但该字段有 metadata={"skip": True}，不会被序列化发送到原生侧）
+                self.page._services.register_service(self._audio)
+                self._audio_just_registered = True
             except Exception as ex:
-                print(f"[TTS] 挂载 flet_audio 控件失败: {ex}")
-        return self._audio, just_mounted
+                print(f"[TTS] 注册 flet_audio service 失败: {ex}")
+                # 兜底：旧方式（可能无效但保留）
+                try:
+                    self.page.services.append(self._audio)
+                    self.page.update()
+                except Exception:
+                    pass
+                self._audio_just_registered = False
+        return self._audio
+
+    async def _wait_for_audio_loaded(self, audio, timeout: float = 5.0) -> bool:
+        """等待 audio 控件的 on_loaded 事件触发（原生侧 _applySource 完成）。
+        返回 True 表示已加载，False 表示超时。"""
+        loop = asyncio.get_event_loop()
+        loaded_future = loop.create_future()
+
+        def _on_loaded(e):
+            if not loaded_future.done():
+                loaded_future.set_result(True)
+
+        audio.on_loaded = _on_loaded
+        try:
+            await asyncio.wait_for(loaded_future, timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            # 清理回调，避免重复触发
+            audio.on_loaded = None
 
     async def _play_flet_audio(self, mp3_path: str, duration: float, stop_event):
         """用 flet_audio 播放本地 mp3 文件，等待播放结束（或停止信号）。"""
@@ -204,16 +243,29 @@ class TTSEngine:
         except Exception:
             size = -1
         print(f"[TTS] flet_audio 播放: {mp3_path} (size={size})")
-        audio, just_mounted = self._get_flet_audio()
-        if just_mounted:
+        audio = self._get_flet_audio()
+        just_registered = getattr(self, "_audio_just_registered", False)
+        if just_registered:
             # 原生 Audio service 首次注册需要一点时间，否则首句可能无声
             await asyncio.sleep(0.5)
+            self._audio_just_registered = False
+
+        # 设置新的 src 并等待原生侧加载完成（避免 play() 在 source 加载前到达）
         audio.src = mp3_path
         try:
             audio.update()
         except Exception:
             pass
-        await asyncio.sleep(0.05)
+
+        # 等待 on_loaded 事件（原生 _applySource 完成后触发），最多等 5 秒
+        loaded = await self._wait_for_audio_loaded(audio, timeout=5.0)
+        if not loaded:
+            print("[TTS] 警告：等待音频加载超时(5s)，仍尝试播放")
+            await asyncio.sleep(0.3)  # 兜底等待
+
+        if stop_event.is_set():
+            return
+
         try:
             await audio.play()
         except Exception as ex:
@@ -407,15 +459,18 @@ class TTSEngine:
             return duration
         # 优先用 flet_audio 应用内播放（可靠出声）；缺失则回退本地文件播放器
         if _FTA is not None:
-            try:
-                await self._play_flet_audio(mp3, duration, stop_event)
-            except Exception as ex:
-                print(f"[TTS] flet_audio 播放失败，回退系统播放器(file://): {ex}")
+            # 用锁防止多个 speak() 并发调用同一 audio 控件（会导致 src 被覆盖、
+            # play() 在错误的 source 上执行、原生侧状态混乱）
+            async with self._play_lock:
                 try:
-                    self._play_via_file_uri(mp3)
-                    await self._wait(duration, stop_event)
-                finally:
-                    self._shutdown_server()
+                    await self._play_flet_audio(mp3, duration, stop_event)
+                except Exception as ex:
+                    print(f"[TTS] flet_audio 播放失败，回退系统播放器(file://): {ex}")
+                    try:
+                        self._play_via_file_uri(mp3)
+                        await self._wait(duration, stop_event)
+                    finally:
+                        self._shutdown_server()
         else:
             try:
                 self._play_via_file_uri(mp3)
