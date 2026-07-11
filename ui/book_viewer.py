@@ -45,6 +45,7 @@ class BookViewer(ft.Container):
         self._tts_engine = None
         self._tts_process = None
         self._read_task = None            # 当前朗读任务（用于点击跳转时等待旧任务结束）
+        self._restart_timer = None         # 调速防抖定时器（避免拖动时反复重启朗读）
         self._last_read_offset = None     # 最近一次朗读到的绝对字符偏移（关闭时回退保存用）
         self._resume_char_offset = None   # 待恢复的字符偏移（__init__ 阶段由 _load_position 写入）
         self._pending_resume_sentence = None  # 重分页后计算出的"续读句下标"
@@ -87,6 +88,7 @@ class BookViewer(ft.Container):
             width=130,
             tooltip="朗读倍速",
             on_change=self._on_speed,
+            on_change_end=self._on_speed_end,
         )
 
         # 音色下拉（倍速右侧）：男 / 女，缺省男
@@ -410,16 +412,54 @@ class BookViewer(ft.Container):
         self._recompute_layout(preserve=True)
 
     def _on_speed(self, e):
-        """倍速滑块：更新 TTS 倍速与标签（下一次朗读生效；桌面端即时作用于语速）。"""
+        """倍速滑块拖动中：实时更新倍速与标签，并防抖地"从当前句用新倍速立即重播"。"""
         v = float(e.control.value)
         self.tts.speed = v
         self.speed_label.value = f"{v:.1f}x"
         self.ft_page.update()
+        self._schedule_restart()
+
+    def _on_speed_end(self, e):
+        """倍速滑块松手：确保最终按新倍速立即重播（覆盖快速拖动未触发的情况）。"""
+        self._schedule_restart()
 
     def _on_voice(self, e):
-        """音色下拉：更新 TTS 音色（下一次朗读生效）。"""
+        """音色下拉：立即切换音色，并从当前句用新音色重播（若正在朗读）。"""
         self.tts.voice = e.control.value or "male"
         self.ft_page.update()
+        if self._is_reading:
+            asyncio.create_task(self._restart_from_current_sentence())
+
+    def _schedule_restart(self):
+        """防抖：朗读中调速时，停止旧播放、0.3s 后以新倍速从当前句重播。
+        拖动过程中定时器不断被重置，仅在你停手后重启一次，避免反复打断。"""
+        if not self._is_reading:
+            return
+        if self._restart_timer is not None:
+            self._restart_timer.cancel()
+        loop = asyncio.get_event_loop()
+        self._restart_timer = loop.call_later(
+            0.3, lambda: asyncio.create_task(self._restart_from_current_sentence())
+        )
+
+    async def _restart_from_current_sentence(self):
+        """停止当前朗读，并以最新速度/音色从"当前句"立即重新朗读。"""
+        if not self._is_reading or self._read_task is None:
+            return
+        start = self._current_sentence_idx if self._current_sentence_idx >= 0 else 0
+        # 停止原播放
+        self._tts_stop_event.set()
+        try:
+            await self._read_task
+        except Exception:
+            pass
+        # 以新参数从当前句重启
+        self._tts_stop_event.clear()
+        self._is_reading = True
+        self.read_btn.icon = ft.Icons.STOP_CIRCLE
+        self.read_btn.tooltip = "停止朗读"
+        self.ft_page.update()
+        self._read_task = asyncio.create_task(self._read_all(start_sentence=start))
 
     # ------------------------------------------------------------------
     # 点击句子选择朗读起点
@@ -457,6 +497,9 @@ class BookViewer(ft.Container):
             # 停止朗读
             self._tts_stop_event.set()
             self._is_reading = False
+            if self._restart_timer is not None:
+                self._restart_timer.cancel()
+                self._restart_timer = None
             try:
                 self.tts.stop()
             except Exception:
@@ -583,6 +626,9 @@ class BookViewer(ft.Container):
         # 朗读结束，恢复按钮状态
         self._is_reading = False
         self._tts_stop_event.clear()
+        if self._restart_timer is not None:
+            self._restart_timer.cancel()
+            self._restart_timer = None
         self._read_task = None
         self.read_btn.icon = ft.Icons.PLAY_ARROW
         self.read_btn.tooltip = "朗读全书（点击句子可从该句开始）"

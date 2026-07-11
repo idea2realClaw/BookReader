@@ -74,7 +74,10 @@ BookReader/
 
 - **框架**：Flet 0.85.3
 - **语言**：Python 3.10+
-- **TTS 引擎**：Edge TTS 在线合成（免费、支持中文男/女声、可调速、中国大陆可用）；桌面端用 pygame 应用内播放（不调用外部播放器），移动端经本地 HTTP 服务交给系统播放器
+- **TTS 引擎（双后端）**：
+  - 桌面端：Edge TTS 在线合成（免费、支持中文男/女声、可调倍速、中国大陆可用），并用 pygame 在应用内播放（不调用外部播放器）。
+  - 移动端（Android）：gTTS 在线合成（纯 Python，可在安卓打包环境安装，`.com` 在大陆可达），经本地 HTTP 服务交给系统播放器。受 gTTS 能力限制，移动端音色/倍速控件不生效。
+  - 原因：Flet 安卓二进制包索引缺 edge-tts 依赖的 `multidict`/`frozenlist` 安卓 wheel，故安卓走 gTTS。
 - **文件解析**：
   - EPUB：zipfile + html.parser（标准库）
   - PDF：pdfplumber

@@ -1,31 +1,48 @@
 """
-跨平台 TTS 引擎（基于 Edge TTS，应用内播放）。
+跨平台 TTS 引擎（双后端）。
 
-- 合成：Edge TTS（微软在线语音），免费、支持中文男女声、可调语速、在中国大陆可访问。
-  - 男声默认：zh-CN-YunyangNeural；女声默认：zh-CN-XiaoxiaoNeural。
-  - 语速通过 Edge TTS 的 rate 参数控制（如 +20%），中英文本自动选对应语音。
-- 桌面端（Windows / macOS / Linux）：用 pygame 在应用内播放合成出的 mp3，
-  不调用任何外部播放器（如 vlc）；语速滑块通过 pygame 播放频率即时生效。
-- 移动端（Android）：受 scoped storage 限制，纯 Python 无法可靠地把应用私有目录音频
-  交给系统播放器，因此经本地 HTTP 服务（127.0.0.1，绕开 scoped storage，无需 INTERNET
-  权限）交给系统播放器播放；语速已烘焙进 mp3（Edge TTS rate），系统播放器按原速播放即可。
-- 若 Edge TTS 合成失败（无网络等），按估算时长静默停顿，保证朗读节奏正常（不会瞬间翻页）。
+平台分流：
+- 桌面端（Windows / macOS / Linux）：Edge TTS + pygame 应用内播放。
+  - Edge TTS（微软在线语音）：免费、支持中文男女声、可调语速、在中国大陆可访问。
+    - 男声默认：zh-CN-YunyangNeural；女声默认：zh-CN-XiaoxiaoNeural。
+    - 语速通过 Edge TTS 的 rate 参数控制（如 +20%）。
+  - pygame 在应用内播放合成出的 mp3，不调用任何外部播放器（如 vlc）；
+    倍速滑块通过 pygame 播放频率即时生效。
+- 移动端（Android）：gTTS 在线合成（纯 Python，可在安卓打包环境安装）。
+  - 合成域名优先 translate.google.com（在中国大陆可达）。
+  - 受限于 gTTS 能力，移动端不支持选择音色/语速（控件在安卓端不生效），但朗读正常。
+  - 播放经本地 HTTP 服务（127.0.0.1，绕开 scoped storage，无需 INTERNET 权限）交给系统播放器。
+
+为何双后端：Flet 的安卓二进制包索引（pypi.flet.dev）只预编译了 aiohttp / yarl，
+没有 edge-tts 依赖的 multidict / frozenlist（C 扩展），因此 edge-tts 无法在安卓构建
+环境安装；而 gTTS 仅依赖纯 Python 的 requests，可正常打包。桌面端则无此限制。
+
+容错：Edge TTS 合成失败（无网络等）时按估算时长静默停顿，保证朗读节奏正常。
 """
 
 import asyncio
 import os
 import re
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 
-import edge_tts
+# Edge TTS（桌面端使用；安卓打包环境无对应 wheel，故做可选导入）
+try:
+    import edge_tts
+except Exception:  # pragma: no cover - 安卓端通常未安装
+    edge_tts = None
+
+# gTTS（移动端使用；纯 Python，可打包）
+try:
+    from gtts import gTTS as _GTTS
+except Exception:  # pragma: no cover
+    _GTTS = None
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
-# 音色映射：男 / 女（缺省男）。每种语言给出 Edge TTS 标准神经语音。
+# 音色映射：男 / 女（缺省男）。每种语言给出 Edge TTS 标准神经语音（仅桌面端生效）。
 VOICE_MAP = {
     "male": {
         "zh": "zh-CN-YunyangNeural",      # 云扬（男）
@@ -49,7 +66,7 @@ def estimate_duration(text: str) -> float:
 
 
 def _estimate_duration(text: str) -> float:
-    """估算朗读时长（秒）。中文约 6 字/秒，英文约 2.5 词/秒（含 Edge TTS 语速后略调）。"""
+    """估算朗读时长（秒）。中文约 6 字/秒，英文约 2.5 词/秒。"""
     if _CJK_RE.search(text):
         chars = len(_CJK_RE.findall(text))
         return max(1.0, chars / 6.0)
@@ -68,8 +85,8 @@ class TTSEngine:
         self.page = page
         self._process = None
         self._httpd = None
-        self.speed = 1.2        # 朗读倍速（1.0~2.0）
-        self.voice = "male"     # 音色：male / female（缺省男）
+        self.speed = 1.2        # 朗读倍速（1.0~2.0，仅桌面端 Edge TTS 生效）
+        self.voice = "male"     # 音色：male / female（缺省男，仅桌面端 Edge TTS 生效）
         self._stop_event = None
 
     # ---- 平台判断 ----
@@ -89,22 +106,34 @@ class TTSEngine:
         text = (text or "").strip()
         if not text:
             return 0.0
-        self._stop_event = stop_event
+        # 按平台分流：移动端走 gTTS，桌面端走 Edge TTS
+        if self._is_mobile():
+            return await self._speak_gtts(text, stop_event)
+        return await self._speak_edge(text, stop_event)
 
-        duration = _estimate_duration(text)
-        # 合成 mp3（Edge TTS）
-        mp3_path = await self._synthesize(text)
-        if mp3_path is None:
-            # 合成失败：仅按节奏停顿
+    def stop(self):
+        # 桌面端：停止 pygame 播放；移动端：关闭本地 HTTP 服务
+        self._stop_pygame()
+        self._stop_process()
+        self._shutdown_server()
+
+    # ==================================================================
+    # 桌面端：Edge TTS 合成 + pygame 应用内播放
+    # ==================================================================
+    async def _speak_edge(self, text: str, stop_event) -> float:
+        if edge_tts is None:
+            # 桌面端未安装 edge_tts（理论上不会发生）：仅按节奏停顿
+            duration = _estimate_duration(text)
             await self._wait(duration, stop_event)
             return duration
 
+        duration = _estimate_duration(text)
+        mp3_path = await self._synthesize_edge(text)
+        if mp3_path is None:
+            await self._wait(duration, stop_event)
+            return duration
         try:
-            if self._is_mobile():
-                self._play_via_local_server(mp3_path)
-                await self._wait(duration, stop_event)
-            else:
-                await self._play_pygame(mp3_path, stop_event, duration)
+            await self._play_pygame(mp3_path, stop_event, duration)
         finally:
             self._shutdown_server()
             try:
@@ -114,14 +143,7 @@ class TTSEngine:
                 pass
         return duration
 
-    def stop(self):
-        # 桌面端：停止 pygame 播放；移动端：关闭本地 HTTP 服务与系统播放器
-        self._stop_pygame()
-        self._stop_process()
-        self._shutdown_server()
-
-    # ---- 合成（Edge TTS） ----
-    async def _synthesize(self, text: str) -> str | None:
+    async def _synthesize_edge(self, text: str) -> str | None:
         voice = self._voice_id(text)
         rate = _rate_string(self.speed)
         try:
@@ -140,7 +162,6 @@ class TTSEngine:
                 pass
             return None
 
-    # ---- 桌面端：pygame 应用内播放（不调用外部播放器） ----
     async def _play_pygame(self, mp3_path: str, stop_event, duration: float):
         try:
             import pygame
@@ -158,7 +179,6 @@ class TTSEngine:
 
         try:
             # 倍速：用略高的播放频率模拟（会伴随轻微音调升高，属淘宝语音式加速）。
-            # pygame 仅支持 22050/44100/48000，取最接近的合法值。
             base = 44100
             if self.speed > 1.02:
                 cand = [48000, 44100, 22050]
@@ -181,7 +201,6 @@ class TTSEngine:
                 print(f"[TTS] pygame 播放失败: {ex}")
                 return
 
-            # 等待播放结束或停止信号
             step = 0.1
             elapsed = 0.0
             while True:
@@ -209,7 +228,50 @@ class TTSEngine:
         except Exception:
             pass
 
-    # ---- 移动端：本地 HTTP 服务 + 系统播放器 ----
+    # ==================================================================
+    # 移动端：gTTS 合成 + 本地 HTTP 服务交给系统播放器
+    # ==================================================================
+    async def _speak_gtts(self, text: str, stop_event) -> float:
+        if _GTTS is None:
+            duration = _estimate_duration(text)
+            await self._wait(duration, stop_event)
+            return duration
+
+        duration = _estimate_duration(text)
+        mp3_path = await self._synthesize_gtts(text)
+        if mp3_path is None:
+            await self._wait(duration, stop_event)
+            return duration
+        try:
+            self._play_via_local_server(mp3_path)
+            await self._wait(duration, stop_event)
+        finally:
+            self._shutdown_server()
+            try:
+                if mp3_path and os.path.exists(mp3_path):
+                    os.unlink(mp3_path)
+            except Exception:
+                pass
+        return duration
+
+    async def _synthesize_gtts(self, text: str) -> str | None:
+        lang = "zh-cn" if _CJK_RE.search(text) else "en"
+        try:
+            fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            # tld="com" 在中国大陆可达（tld="cn" 合成接口返回 404，不可用）
+            await asyncio.to_thread(_GTTS(text=text, lang=lang, tld="com").save, mp3_path)
+            print(f"[TTS] gTTS 合成成功 lang={lang}")
+            return mp3_path
+        except Exception as ex:
+            print(f"[TTS] gTTS 合成失败: {ex}")
+            try:
+                if "mp3_path" in dir() and os.path.exists(mp3_path):
+                    os.unlink(mp3_path)
+            except Exception:
+                pass
+            return None
+
     def _play_via_local_server(self, mp3_path: str):
         import functools
         import http.server
@@ -238,17 +300,21 @@ class TTSEngine:
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
         url = f"http://127.0.0.1:{port}/{fname}"
-        self._process = subprocess.Popen(
-            [
-                "am", "start",
-                "-a", "android.intent.action.VIEW",
-                "-t", "audio/mpeg",
-                "-d", url,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        print(f"[TTS] 安卓播放 URL: {url}")
+        try:
+            self._process = subprocess.Popen(
+                [
+                    "am", "start",
+                    "-a", "android.intent.action.VIEW",
+                    "-t", "audio/mpeg",
+                    "-d", url,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"[TTS] 安卓播放 URL: {url}")
+        except Exception as ex:
+            # 启动系统播放器失败（如非安卓环境）不应中断朗读节奏
+            print(f"[TTS] 启动系统播放器失败: {ex}")
 
     def _shutdown_server(self):
         httpd = self._httpd
@@ -261,6 +327,9 @@ class TTSEngine:
         except Exception:
             pass
 
+    # ==================================================================
+    # 通用：按估算时长等待（可被打断）
+    # ==================================================================
     async def _wait(self, duration: float, stop_event):
         elapsed = 0.0
         step = 0.1
