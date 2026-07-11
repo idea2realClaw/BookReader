@@ -8,6 +8,11 @@ product = "BookReader"
 org = "com.bookreader.app"
 description = "A simple and elegant eBook reader"
 
+[tool.flet.android.permission]
+"android.permission.WRITE_EXTERNAL_STORAGE" = true
+"android.permission.READ_EXTERNAL_STORAGE" = true
+"android.permission.MANAGE_EXTERNAL_STORAGE" = true
+
 [build-system]
 requires = ["flet"]
 build-backend = "flet.build:build_backend"
