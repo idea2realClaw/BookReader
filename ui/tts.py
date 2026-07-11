@@ -55,8 +55,11 @@ class TTSEngine:
         self.speed = 1.0  # 朗读倍速（gTTS 在线合成不直接支持倍速，仅作预留）
         self._stop_event = None  # 当前朗读会话的停止事件（供回调使用）
 
-    # 合成域名优先级：优先 .cn（大陆友好），失败回退 .com（大陆同样可达）
-    _TTS_TLDS = ("cn", "com")
+    # 合成域名优先级：优先 .com.cn（面向中国大陆，需在境内网络可用），
+    # 不可达时回退 .com（同样在中国大陆可达）。gTTS 自 2.1.0 起支持 tld 参数。
+    # 注意：gTTS 不支持 tld='cn'（translate.google.cn 合成接口返回 404），
+    # 故用 'com.cn' 而非 'cn'。
+    _TTS_TLDS = ("com.cn", "com")
 
     # ---- 平台判断 ----
     def _is_mobile(self) -> bool:
@@ -102,7 +105,7 @@ class TTSEngine:
                     saved = tld
                     break
                 except Exception as ex:
-                    print(f"[TTS] gTTS 合成失败(tld={tld}): {ex}")
+                    print(f"[TTS] gTTS 合成失败(translate.google.{tld}): {ex}")
             if saved is None:
                 print(f"[TTS] gTTS 全部域名合成失败（可能无网络），仅按节奏停顿")
                 await self._wait(duration, stop_event)
