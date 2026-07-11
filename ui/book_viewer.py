@@ -7,8 +7,13 @@ import os
 import re
 from reader import open_book, BookReader
 from ui.tts import TTSEngine, estimate_duration
+from paths import app_data_path
 
-BOOKS_JSON_PATH = os.path.expanduser("~/.bookreader/books.json")
+# 阅读位置持久化文件路径（与书架 shelf.json 分离，避免结构冲突互相覆盖）
+# 跨平台：桌面=~/.bookreader/books.json，安卓=FLET_APP_STORAGE_DATA/books.json
+# （不能直接用 os.path.expanduser('~/.bookreader/...') —— 安卓上 ~ 解析为 /data
+# 会导致 /data/.bookreader Permission denied）
+BOOKS_JSON_PATH = app_data_path("books.json")
 
 # 句子切分正则：保留句末标点（中英文），并记录每个句子在原文本中的起始偏移。
 # 形如 "你好。世界" -> [("你好。", 0), ("世界", 3)]

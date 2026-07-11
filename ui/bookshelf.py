@@ -6,9 +6,13 @@ import flet as ft
 from version import APP_VERSION
 from reader import open_book
 from ui.book_viewer import BookViewer
+from paths import app_data_path
 
 # 书籍列表持久化文件路径（与阅读位置 books.json 分离，避免结构冲突互相覆盖）
-BOOKS_JSON_PATH = os.path.expanduser("~/.bookreader/shelf.json")
+# 跨平台：桌面=~/.bookreader/shelf.json，安卓=FLET_APP_STORAGE_DATA/shelf.json
+# （不能直接用 os.path.expanduser('~/.bookreader/...') —— 安卓上 ~ 解析为 /data
+# 会导致 /data/.bookreader Permission denied）
+BOOKS_JSON_PATH = app_data_path("shelf.json")
 
 
 class BookShelf(ft.Container):
