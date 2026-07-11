@@ -74,7 +74,7 @@ BookReader/
 
 - **框架**：Flet 0.85.3
 - **语言**：Python 3.10+
-- **TTS 引擎**：pyttsx3 / SAPI.SpVoice (Windows)
+- **TTS 引擎**：gTTS 在线合成（桌面/移动端统一，合成域名优先 `.cn`、不可用时回退 `.com`，均在中国大陆可达）
 - **文件解析**：
   - EPUB：zipfile + html.parser（标准库）
   - PDF：pdfplumber
