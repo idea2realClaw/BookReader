@@ -93,14 +93,6 @@ jobs:
           path: build/apk/*.apk
           retention-days: 30
 
-      - name: Upload APK as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bookreader-android-apk
-          path: build/apk/*.apk
-          retention-days: 30
-
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
