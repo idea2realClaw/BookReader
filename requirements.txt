@@ -1,11 +1,15 @@
 flet>=0.85.0
 # flet_audio：Flet 官方音频控件（Flutter audioplayers），安卓端 TTS 应用内播放用，
 # 原生支持 Android，无 C 扩展依赖。
-# 注意：Python 端通过本文件安装；dart 端（AudioService 原生控件）必须在
-# pyproject.toml 的 [tool.flet.flutter.dependencies] 里声明 flet_audio = "*"，
-# flet build apk 才会把 dart 包打进 APK。两端缺一不可：
-# - 只有 Python 端：import 成功但 service 注册失败 → play() 超时 → 听不到声音
-# - 只有 dart 端：import 失败 → 走 am start 回退 → 系统播放器不自动播放
+# 两端依赖（flet 0.85.3，经源码验证）：
+#   - Python 端：通过本文件安装（import flet_audio）
+#   - dart 端（AudioService 原生控件）：必须配合 CI 的 `--source-packages flet_audio`
+#     该参数让 serious-python 从 sdist（源码分发）安装 flet_audio，
+#     sdist 包含 flutter/flet_audio/ dart 子目录（预编译 wheel 不含！）
+#     serious-python 提取 dart 子目录 → flet build 注册到 pubspec.yaml →
+#     Flutter 编译 flet_audio dart 包 → 打包进 APK
+# 缺少 --source-packages → 用 wheel 安装 → 无 dart 子目录 → APK 不含 dart 端 →
+#   service 注册失败 → play() 30秒超时 → 听不到声音
 flet_audio>=0.85.0
 pypdf>=6.0.0
 gtts>=2.5.0

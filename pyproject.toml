@@ -8,10 +8,14 @@ product = "BookReader"
 org = "com.bookreader.app"
 description = "A simple and elegant eBook reader"
 
-# Flutter dart 包依赖：flet_audio 的 Python 端通过 requirements.txt 安装，
-# 但 dart 端（AudioService 原生控件）必须在这里声明，flet build apk 才会把它打进 APK。
-# 之前只装了 Python 端 → import flet_audio 成功，但原生侧没有 AudioService 类 →
-# service 注册失败 → play() 30 秒超时 → 听不到声音。
+# Flutter dart 包依赖声明（文档说支持，但 flet 0.85.3 的 build_base.py 实际不直接读取此段）。
+# flet_audio dart 包真正打包进 APK 的机制是 CI 的 --source-packages flet_audio：
+#   1. 设置 SERIOUS_PYTHON_ALLOW_SOURCE_DISTRIBUTIONS 环境变量
+#   2. serious-python 从 sdist（源码分发）安装 flet_audio（wheel 不含 flutter dart 子目录）
+#   3. serious-python 提取 flutter/flet_audio/ dart 子目录到 flutter-packages-temp/
+#   4. flet build 扫描该目录，注册到 pubspec.yaml
+#   5. Flutter 编译 flet_audio dart 包 → 打包进 APK
+# 保留此段仅为文档兼容（未来 flet 版本可能直接读取）。
 [tool.flet.flutter.dependencies]
 flet_audio = "*"
 
