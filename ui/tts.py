@@ -98,6 +98,11 @@ class TTSEngine:
         self.voice = "male"     # 音色：male / female（缺省男）
         self._stop_event = None
         self._audio = None  # flet_audio.Audio 控件（安卓端应用内播放，懒创建）
+        try:
+            print(f"[TTS] 初始化：平台={'mobile' if self._is_mobile() else 'desktop'}，"
+                  f"flet_audio={'可用' if _FTA is not None else '不可用(将回退系统播放器)'}")
+        except Exception:
+            pass
 
     # ---- 平台判断 ----
     def _is_mobile(self) -> bool:
@@ -202,13 +207,27 @@ class TTSEngine:
         audio, just_mounted = self._get_flet_audio()
         if just_mounted:
             # 原生 Audio service 首次注册需要一点时间，否则首句可能无声
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.5)
         audio.src = mp3_path
         try:
             audio.update()
         except Exception:
             pass
-        await audio.play()
+        await asyncio.sleep(0.05)
+        try:
+            await audio.play()
+        except Exception as ex:
+            print(f"[TTS] flet_audio.play() 抛出异常: {ex}")
+            raise
+        # 诊断：播放 0.4s 后检查是否真的在播（位置应 > 0）；否则给出明确告警
+        try:
+            await asyncio.sleep(0.4)
+            pos = await audio.get_current_position()
+            print(f"[TTS] flet_audio 播放中 position={pos}")
+            if pos is None or (hasattr(pos, 'in_milliseconds') and pos.in_milliseconds == 0):
+                print("[TTS] 警告：play() 已调用但播放位置仍为 0，可能无声（检查 flet_audio 原生插件是否打进 APK）")
+        except Exception as ex:
+            print(f"[TTS] 读取播放位置失败(非致命): {ex}")
         step = 0.1
         elapsed = 0.0
         limit = duration + 2.0  # 给真实播放一点余量，避免提前切断尾音
@@ -377,28 +396,29 @@ class TTSEngine:
     # ==================================================================
     async def _speak_mobile(self, text: str, stop_event, prefetched_path=None) -> float:
         """移动端朗读：优先用 flet_audio 应用内播放（可靠出声）；flet_audio 缺失时
-        回退到本地 HTTP + 系统播放器。prefetched_path 为预取好的 mp3 文件，传给它
-        可跳过联网合成、实现翻页无缝衔接。"""
+        回退到本地文件 file:// + 系统播放器（避开 HTTP 的 cleartext 限制）。
+        prefetched_path 为预取好的 mp3 文件，传给它可跳过联网合成、实现翻页无缝衔接。"""
         duration = _estimate_duration(text)
+        print(f"[TTS] 安卓播放：flet_audio={'可用' if _FTA is not None else '不可用→回退系统播放器(file://)'}")
         mp3 = prefetched_path if (prefetched_path and os.path.exists(prefetched_path)) \
             else await self._synthesize_mobile_to_file(text)
         if mp3 is None:
             await self._wait(duration, stop_event)
             return duration
-        # 优先用 flet_audio 应用内播放（可靠出声）；缺失则回退系统播放器
+        # 优先用 flet_audio 应用内播放（可靠出声）；缺失则回退本地文件播放器
         if _FTA is not None:
             try:
                 await self._play_flet_audio(mp3, duration, stop_event)
             except Exception as ex:
-                print(f"[TTS] flet_audio 播放失败，回退系统播放器: {ex}")
+                print(f"[TTS] flet_audio 播放失败，回退系统播放器(file://): {ex}")
                 try:
-                    self._play_via_local_server(mp3)
+                    self._play_via_file_uri(mp3)
                     await self._wait(duration, stop_event)
                 finally:
                     self._shutdown_server()
         else:
             try:
-                self._play_via_local_server(mp3)
+                self._play_via_file_uri(mp3)
                 await self._wait(duration, stop_event)
             finally:
                 self._shutdown_server()
@@ -496,6 +516,47 @@ class TTSEngine:
         except Exception as ex:
             # 启动系统播放器失败（如非安卓环境）不应中断朗读节奏
             print(f"[TTS] 启动系统播放器失败: {ex}")
+
+    def _android_public_path(self, mp3_path: str) -> str:
+        """把一个 app 私有 mp3 复制到一个系统播放器（不同 UID）也能读到的位置，
+        返回该副本的本地路径。优先 /sdcard/BookReader（部分 ROM 可读写），
+        失败则退回原路径。复制副本是为了绕开 scoped storage 对 app 私有文件的跨应用读取限制。"""
+        base = os.environ.get("EXTERNAL_STORAGE") or "/sdcard"
+        dst_dir = os.path.join(base, "BookReader")
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+            dst = os.path.join(dst_dir, os.path.basename(mp3_path))
+            with open(mp3_path, "rb") as src_f, open(dst, "wb") as dst_f:
+                dst_f.write(src_f.read())
+            try:
+                os.chmod(dst, 0o644)
+            except Exception:
+                pass
+            return dst
+        except Exception as ex:
+            print(f"[TTS] 复制到公共目录失败，直接用原路径: {ex}")
+            return mp3_path
+
+    def _play_via_file_uri(self, mp3_path: str):
+        """回退方案：把 mp3 放到系统播放器可读的位置，用 file:// URI 拉起系统播放器。
+        与 _play_via_local_server 的区别：不经过 HTTP/127.0.0.1，避免 Android 9+ 默认
+        禁止 cleartext 导致系统播放器拉不到音频而静默失败。"""
+        public = self._android_public_path(mp3_path)
+        uri = "file://" + public
+        try:
+            self._process = subprocess.Popen(
+                [
+                    "am", "start",
+                    "-a", "android.intent.action.VIEW",
+                    "-t", "audio/mpeg",
+                    "-d", uri,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"[TTS] 安卓播放 file:// URI: {uri}")
+        except Exception as ex:
+            print(f"[TTS] 启动系统播放器(file://)失败: {ex}")
 
     def _shutdown_server(self):
         httpd = self._httpd

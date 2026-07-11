@@ -139,8 +139,9 @@ class LogWindow(ft.Container):
         # 折叠/展开按钮
         self.toggle_btn = ft.IconButton(
             ft.Icons.EXPAND_MORE,
-            tooltip="折叠日志窗口",
-            icon_size=20,
+            tooltip="折叠/展开日志窗口",
+            icon_size=18,
+            style=ft.ButtonStyle(padding=4),
             on_click=self._toggle_collapse,
         )
         
@@ -148,20 +149,27 @@ class LogWindow(ft.Container):
         self.clear_btn = ft.IconButton(
             ft.Icons.CLEAR,
             tooltip="清除日志",
-            icon_size=20,
+            icon_size=18,
+            style=ft.ButtonStyle(padding=4),
             on_click=self._clear_logs,
         )
         
-        # 标题栏
-        self.header = ft.Row(
-            [
-                ft.Text("实时日志", size=14, weight=ft.FontWeight.BOLD),
-                ft.Row(
-                    [self.clear_btn, self.toggle_btn],
-                    spacing=0,
-                ),
-            ],
-            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        # 标题栏：整条都可点击折叠/展开（手机上小按钮点不到时，点标题栏任意处即可）
+        self.header = ft.Container(
+            content=ft.Row(
+                [
+                    ft.Text("实时日志", size=13, weight=ft.FontWeight.BOLD),
+                    ft.Row(
+                        [self.clear_btn, self.toggle_btn],
+                        spacing=0,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+            on_click=self._toggle_collapse,
+            padding=ft.padding.only(left=8, right=4, top=4, bottom=4),
+            ink=True,
         )
         
         # 日志容器
@@ -183,7 +191,7 @@ class LogWindow(ft.Container):
         
         self.expand = False
         self.height = 40  # 折叠态默认只显示标题栏
-        self.padding = 10
+        self.padding = 0  # 标题栏自带内边距，避免折叠态把按钮裁掉
         self.bgcolor = ft.Colors.WHITE
         self.border = ft.Border(
             left=ft.BorderSide(1, ft.Colors.GREY_300),
@@ -218,6 +226,11 @@ class LogWindow(ft.Container):
         if self.on_toggle:
             self.on_toggle(self.height)
         
+        # 同时更新窗体自身与整页，确保折叠/展开在移动端可靠生效
+        try:
+            self.update()
+        except Exception:
+            pass
         self.ft_page.update()
     
     def _clear_logs(self, e):
