@@ -168,7 +168,7 @@ class LogWindow(ft.Container):
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
             on_click=self._toggle_collapse,
-            padding=ft.padding.only(left=8, right=4, top=4, bottom=4),
+            padding=ft.Padding.only(left=8, right=4, top=4, bottom=4),
             ink=True,
         )
         
