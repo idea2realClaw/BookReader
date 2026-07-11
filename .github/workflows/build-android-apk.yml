@@ -75,6 +75,7 @@ jobs:
             --build-number "${{ github.run_number }}" \
             --build-version "${{ steps.ver.outputs.version }}" \
             --android-adaptive-icon-background "#1565C0" \
+            --include-packages flet_audio \
             --skip-flutter-doctor \
             --yes
 

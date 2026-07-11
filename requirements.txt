@@ -1,4 +1,7 @@
 flet>=0.85.0
+# flet_audio：Flet 官方音频控件（Flutter audioplayers），安卓端 TTS 应用内播放用，
+# 原生支持 Android，无 C 扩展依赖。需配合 `flet build apk --include-packages flet_audio`。
+flet_audio>=0.85.0
 pypdf>=6.0.0
 gtts>=2.5.0
 requests>=2.31.0

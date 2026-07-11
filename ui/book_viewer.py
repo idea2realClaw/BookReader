@@ -14,6 +14,9 @@ BOOKS_JSON_PATH = os.path.expanduser("~/.bookreader/books.json")
 # 形如 "你好。世界" -> [("你好。", 0), ("世界", 3)]
 _SENT_RE = re.compile(r'\s*([^。！？\.\!\?]+[。！？\.\!\?]?)')
 
+# 分页断页用的"句末标点"集合（页尾应落在此类标点上，使句子不被截断）。
+_PAGE_BREAK_RE = re.compile(r"[。！？!?；;…\n]")
+
 
 class BookViewer(ft.Container):
     """Single-page book viewer with TTS read-aloud support.
@@ -55,6 +58,7 @@ class BookViewer(ft.Container):
         # 整本文本（用于按窗口动态分页）
         self.full_text = self.reader.get_full_text()
         self.pages: list = []
+        self._page_start_offsets = []  # 每页在整本文本中的绝对起始偏移（变长分页用）
         self._page_chars = 600  # 每页字符数（动态计算）
         self._log_gap = 40  # 当前日志窗口高度（折叠默认 40）
 
@@ -156,6 +160,9 @@ class BookViewer(ft.Container):
         self.nav_row.right = 0
         self.nav_row.bottom = 10  # 初始值，set_log_gap 会更新为 gap + 10
 
+        # 按屏幕宽度响应化底部控制栏（滑块随屏宽缩短，确保最右翻页键不溢出）
+        self._layout_nav()
+
         # 文本区：上下左右贴边；底部预留出 nav_row + 日志高度，避免被遮挡或过长
         self.text_container = ft.Container(
             content=self.page_text,
@@ -186,9 +193,10 @@ class BookViewer(ft.Container):
         self._recompute_layout(preserve=True)
         self.ft_page.on_resize = self._on_resize
 
-        # 若存在续读位置，打开即自动从该句继续朗读（在事件循环中调度，确保挂载后执行）
+        # 若存在续读位置，打开即把光标定位到该句并高亮，但不自动朗读
+        # （按钮保持"播放"状态，由用户按下播放键时从该行继续）。
         if self._pending_resume_sentence is not None and self._pending_resume_sentence >= 0:
-            asyncio.create_task(self._auto_resume())
+            asyncio.create_task(self._apply_resume_highlight())
 
     # ------------------------------------------------------------------
     # 动态分页
@@ -206,8 +214,66 @@ class BookViewer(ft.Container):
         text_avail_w = w - 160  # 文本容器内边距左右各 80
         # 中文字符宽约 font_size；拉丁字符更窄，按 font_size 估算为保守下界（不会溢出）
         cpl = max(1, int(text_avail_w / fs * 0.95))      # 每行字符数
-        lpp = max(1, int(text_avail_h / (fs * 1.5) * 0.9))  # 每页行数
+        lpp = max(1, int(text_avail_h / (fs * 1.5) * 0.82))  # 每页行数（0.82 预留标点断句尾部余量）
         return max(1, cpl * lpp)
+
+    # ------------------------------------------------------------------
+    # 标点感知分页
+    # ------------------------------------------------------------------
+    def _paginate(self, full: str, page_chars: int):
+        """按窗口尺寸把整本文本切成"可视页"。
+
+        每页尽量在句末标点处断开（页尾最后一字为标点），使朗读/翻页不被句子
+        截断；若从 page_chars 起向后一段范围内都没有标点（超长无标点句子），
+        则在 page_chars 处硬切，避免无限搜索、也避免把整页撑得过长溢出。
+        返回 (pages, starts)：pages 为每页文本，starts 为每页在整本文本中的
+        绝对起始偏移（变长分页下用于精确换算续读位置）。
+        """
+        pages: list = []
+        starts: list = []
+        n = len(full)
+        if page_chars < 1:
+            page_chars = 1
+        # 向后搜索标点的窗口上限：既保证句子尽量完整，又防止超长无标点句子时
+        # 把整页撑得过长导致溢出。
+        lookahead = min(page_chars, 150)
+        pos = 0
+        while pos < n:
+            target = pos + page_chars
+            if target >= n:
+                pages.append(full[pos:])
+                starts.append(pos)
+                break
+            seg = full[target: target + lookahead]
+            m = _PAGE_BREAK_RE.search(seg)
+            end = target + m.start() + 1 if m else target  # 包含标点；无标点则硬切
+            if end <= pos:
+                end = target
+            pages.append(full[pos:end])
+            starts.append(pos)
+            pos = end
+        if not pages:
+            pages = [""]
+            starts = [0]
+        return pages, starts
+
+    def _page_index_for_offset(self, offset: int) -> int:
+        """返回包含 offset 的页码下标（基于实际页起始偏移二分查找）。"""
+        starts = self._page_start_offsets
+        if not starts:
+            return 0
+        if offset <= starts[0]:
+            return 0
+        if offset >= starts[-1]:
+            return len(starts) - 1
+        lo, hi = 0, len(starts) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if starts[mid] <= offset:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
 
     def _recompute_layout(self, preserve=True):
         """按当前窗口尺寸重新分页；preserve=True 时尽量保留当前阅读进度。
@@ -219,8 +285,8 @@ class BookViewer(ft.Container):
             page_chars = self._compute_page_chars()
             self._page_chars = page_chars
             full = self.full_text
-            self.pages = [full[i: i + page_chars] for i in range(0, len(full), page_chars)] or [""]
-            self.current = min(max(self._resume_char_offset // page_chars, 0), len(self.pages) - 1)
+            self.pages, self._page_start_offsets = self._paginate(full, page_chars)
+            self.current = self._page_index_for_offset(self._resume_char_offset)
             self._pending_resume_sentence = self._sentence_index_at_offset(
                 self.current, self._resume_char_offset
             )
@@ -229,13 +295,13 @@ class BookViewer(ft.Container):
             self._update_page_display(highlight=highlight)
             return
 
-        offset = self.current * self._page_chars if (preserve and self.pages) else 0
+        offset = self._page_start_offsets[self.current] if (preserve and self.pages and self._page_start_offsets) else 0
         page_chars = self._compute_page_chars()
         self._page_chars = page_chars
         full = self.full_text
-        self.pages = [full[i: i + page_chars] for i in range(0, len(full), page_chars)] or [""]
+        self.pages, self._page_start_offsets = self._paginate(full, page_chars)
         if preserve:
-            self.current = min(max(offset // page_chars, 0), len(self.pages) - 1)
+            self.current = self._page_index_for_offset(offset)
         else:
             self.current = 0
         self._update_page_display()
@@ -259,6 +325,8 @@ class BookViewer(ft.Container):
         self.text_container.left = 0
         self.text_container.right = 0
         self.text_container.top = 0
+        # 控制栏宽度跟随屏宽（如日志面板展开/折叠改变了可用宽度）
+        self._layout_nav()
         # 日志高度变化会改变可用文本高度 → 重新分页以适配
         try:
             self._recompute_layout(preserve=True)
@@ -290,7 +358,7 @@ class BookViewer(ft.Container):
         """根据绝对字符偏移，返回该页中应续读的句子下标。"""
         if not (0 <= page_idx < len(self.pages)):
             return 0
-        local = global_offset - page_idx * self._page_chars
+        local = global_offset - self._page_start_offsets[page_idx]
         sents = self._split_into_sentences_with_offsets(self.pages[page_idx])
         if not sents:
             return 0
@@ -407,8 +475,30 @@ class BookViewer(ft.Container):
             await self._clear_highlight()
             self._update_page_display()
 
+    def _layout_nav(self):
+        """按屏幕宽度响应化底部控制栏：速度滑块随屏宽缩短，确保最右的向后翻页键
+        始终贴在屏幕最右边、不被挤出屏外。在 __init__ / 窗口缩放 / 日志展开时调用。"""
+        w = int(self.ft_page.width or 1400)
+        if w < 480:            # 手机竖屏：紧凑
+            self.speed_slider.width = max(70, int(w * 0.26))
+            self.voice_dd.width = 80
+            self.speed_label.width = 34
+        elif w < 800:          # 小平板 / 窄窗
+            self.speed_slider.width = max(100, int(w * 0.24))
+            self.voice_dd.width = 92
+            self.speed_label.width = 38
+        else:                  # 桌面宽窗
+            self.speed_slider.width = 130
+            self.voice_dd.width = 110
+            self.speed_label.width = 42
+        try:
+            self.ft_page.update()
+        except Exception:
+            pass
+
     def _on_resize(self, e):
         # 窗口变化：重新分页（字号/每页字符数随之调整，并保留进度）
+        self._layout_nav()
         self._recompute_layout(preserve=True)
 
     def _on_speed(self, e):
@@ -510,40 +600,50 @@ class BookViewer(ft.Container):
             self.ft_page.update()
             print(f"[BookViewer] 停止朗读")
         else:
-            # 开始朗读（当前页第一句）
+            # 开始朗读：优先从已恢复/已点击的句开始（否则当前页第一句）
+            start = self._current_sentence_idx if self._current_sentence_idx >= 0 else 0
             self._tts_stop_event.clear()
             self._is_reading = True
             self.read_btn.icon = ft.Icons.STOP_CIRCLE
             self.read_btn.tooltip = "停止朗读"
             self.ft_page.update()
-            print(f"[BookViewer] 开始朗读")
-            self._read_task = asyncio.create_task(self._read_all(start_sentence=0))
+            print(f"[BookViewer] 开始朗读（从第{start + 1}句）")
+            self._read_task = asyncio.create_task(self._read_all(start_sentence=start))
 
-    async def _auto_resume(self):
-        """打开书籍后：若存在续读位置，自动从该句继续朗读。"""
+    async def _apply_resume_highlight(self):
+        """打开书籍后：若存在续读位置，把光标定位到该句并高亮，但不自动朗读。
+
+        按钮保持"播放"状态（用户按下播放键时从该行继续朗读）。
+        """
         if self._pending_resume_sentence is not None and self._pending_resume_sentence >= 0:
             start = self._pending_resume_sentence
             self._pending_resume_sentence = None
-            # 进入朗读状态
-            self._tts_stop_event.clear()
-            self._is_reading = True
-            self.read_btn.icon = ft.Icons.STOP_CIRCLE
-            self.read_btn.tooltip = "停止朗读"
-            self.ft_page.update()
-            print(f"[BookViewer] 自动续读：从第{self.current + 1}页第{start + 1}句")
-            self._read_task = asyncio.create_task(self._read_all(start_sentence=start))
+            self._current_sentence_idx = start
+            print(f"[BookViewer] 恢复续读位置：第{self.current + 1}页第{start + 1}句（待播放）")
+            await self._highlight_sentence(start)
 
-    async def _wait_for(self, seconds: float):
-        """等待 seconds 秒，但随时可被停止事件中断。"""
+    async def _wait_for(self, seconds: float, done_task=None):
+        """等待 seconds 秒，但随时可被停止事件中断；若 done_task 已完成（整页音频已播完）
+        则提前返回，避免估算时长偏长导致的翻页前静音停顿。"""
         step = 0.1
         elapsed = 0.0
         while elapsed < seconds and not self._tts_stop_event.is_set():
+            if done_task is not None and done_task.done():
+                return
             await asyncio.sleep(step)
             elapsed += step
 
     async def _read_all(self, start_sentence=0):
-        """从当前页的 start_sentence 句开始朗读，自动翻页；逐句记录位置。"""
+        """从当前页的 start_sentence 句开始朗读，自动翻页；逐句记录位置。
+
+        翻页停顿优化：
+        - 播放当前页时并行预取下一页音频（synthesize_to_path），翻页后直接播放、
+          无需再联网合成，消除翻页后的网络等待。
+        - 逐句高亮等待以"真实音频播完"为准（done_task），估算时长偏长时提前结束，
+          消除翻页前的静音停顿。
+        """
         first_page = True
+        prefetch_tasks = {}  # page_index -> 预取任务（synthesize_to_path 的 Task）
         while self._is_reading and not self._tts_stop_event.is_set():
             try:
                 # 获取当前页文本（窗口分页后的可视页）
@@ -569,7 +669,7 @@ class BookViewer(ft.Container):
                         break
 
                 # 当前页起始的绝对字符偏移（用于换算续读位置）
-                page_char_offset = self.current * self._page_chars
+                page_char_offset = self._page_start_offsets[self.current]
 
                 start_idx = start_sentence if first_page else 0
                 first_page = False
@@ -585,10 +685,22 @@ class BookViewer(ft.Container):
 
                 durations = [estimate_duration(s) for s, _ in sentences]
 
-                # 整段一次性朗读（桌面端稳定；安卓端一次系统播放器）
-                speak_task = asyncio.create_task(self._speak_text(speak_text))
+                # 取本页预取音频（上一页播放时已并行合成好）
+                pf_task = prefetch_tasks.pop(self.current, None)
+                prefetched = await pf_task if pf_task is not None else None
 
-                # 按估算时长逐句高亮，与朗读节奏大致同步；同时记录每句位置
+                # 预取下一页（与播放本页并行，翻页后无需再联网等待）
+                nxt = self.current + 1
+                if nxt < len(self.pages) and nxt not in prefetch_tasks:
+                    prefetch_tasks[nxt] = asyncio.create_task(
+                        self.tts.synthesize_to_path(self.pages[nxt])
+                    )
+
+                # 整段一次性朗读（桌面端稳定；安卓端一次系统播放器）
+                speak_task = asyncio.create_task(self._speak_text(speak_text, prefetched_path=prefetched))
+
+                # 按估算时长逐句高亮，与朗读节奏大致同步；同时记录每句位置。
+                # 一旦整页音频播完（speak_task 完成）即提前结束等待，避免估算偏长造成静音。
                 for i in range(start_idx, len(sentences)):
                     if self._tts_stop_event.is_set():
                         break
@@ -596,13 +708,20 @@ class BookViewer(ft.Container):
                     # 朗读到该句即记录"绝对字符偏移"，作为续读位置
                     global_off = page_char_offset + sentences[i][1]
                     self._save_position(global_off)
-                    await self._wait_for(durations[i])
+                    await self._wait_for(durations[i], speak_task)
 
                 # 等待整页朗读结束
                 try:
                     await speak_task
                 except Exception as ex:
                     print(f"[BookViewer] 朗读任务异常: {ex}")
+
+                # 播放结束，清理本页预取临时文件（若使用了预取）
+                if prefetched and os.path.exists(prefetched):
+                    try:
+                        os.unlink(prefetched)
+                    except Exception:
+                        pass
 
                 if self._tts_stop_event.is_set():
                     break
@@ -623,6 +742,18 @@ class BookViewer(ft.Container):
                 traceback.print_exc()
                 break
 
+        # 清理未使用的预取任务及其临时文件
+        for t in prefetch_tasks.values():
+            try:
+                if t.done():
+                    p = t.result()
+                    if p and os.path.exists(p):
+                        os.unlink(p)
+                else:
+                    t.cancel()
+            except Exception:
+                pass
+
         # 朗读结束，恢复按钮状态
         self._is_reading = False
         self._tts_stop_event.clear()
@@ -639,14 +770,14 @@ class BookViewer(ft.Container):
         # 结束时再保存一次当前位置（兜底；读句中已逐句保存）
         self._save_position()
 
-    async def _speak_text(self, text: str):
-        """使用跨平台 TTS 朗读文本（支持停止）。"""
+    async def _speak_text(self, text: str, prefetched_path=None):
+        """使用跨平台 TTS 朗读文本（支持停止）。prefetched_path 为预取好的 mp3 文件。"""
         if not text.strip():
             return
 
         print(f"[BookViewer] TTS朗读: {len(text)} 字符")
         try:
-            await self.tts.speak(text, self._tts_stop_event)
+            await self.tts.speak(text, self._tts_stop_event, prefetched_path=prefetched_path)
         except Exception as ex:
             print(f"[BookViewer] TTS错误: {ex}")
             import traceback
@@ -665,7 +796,8 @@ class BookViewer(ft.Container):
                 if self._last_read_offset is not None:
                     global_offset = self._last_read_offset
                 else:
-                    global_offset = self.current * self._page_chars
+                    # 变长分页下用真实页起始偏移（page_chars 仅为名义估算）
+                    global_offset = self._page_start_offsets[self.current] if self._page_start_offsets else self.current * self._page_chars
             else:
                 self._last_read_offset = global_offset
 
@@ -688,7 +820,7 @@ class BookViewer(ft.Container):
                 print(f"[BookViewer] 无法获取书籍路径，跳过保存位置")
                 return
 
-            page_idx = global_offset // self._page_chars if self._page_chars else 0
+            page_idx = self._page_index_for_offset(global_offset)
             found = False
             for book in data["books"]:
                 if book["path"] == book_path:

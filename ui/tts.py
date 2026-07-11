@@ -11,8 +11,11 @@
 
 播放：
 - 桌面端（Windows/macOS/Linux）：pygame 应用内播放，不调用外部播放器（如 vlc）。
-- 移动端（Android）：合成的 mp3 经本地 HTTP 服务（127.0.0.1，无需 INTERNET 权限）
-  交给系统播放器播放。
+- 移动端（Android）：用 flet_audio（Flet 官方音频控件，基于 Flutter audioplayers，
+  原生支持 Android，无 C 扩展依赖）做应用内播放合成的 mp3 文件 —— 可靠出声。
+  （早期用 `am start` 拉系统播放器，但系统播放器打开音频后默认不自动播放，
+   导致"朗读流程在跑却听不到声"，故改用 flet_audio。）flet_audio 缺失时回退
+  本地 HTTP + 系统播放器。
 容错：Edge 合成失败（无网络等）时，移动端回退 gTTS，桌面端按估算时长静默停顿，
       保证朗读节奏正常。
 """
@@ -24,6 +27,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from typing import Optional
 
 # Edge TTS 轻量客户端（纯 Python，可打包）。若 websockets 缺失则为本模块导入失败时置 None。
 try:
@@ -36,6 +40,14 @@ try:
     from gtts import gTTS as _GTTS
 except Exception:  # pragma: no cover
     _GTTS = None
+
+# flet_audio：Flet 官方音频控件（基于 Flutter audioplayers），原生支持 Android，
+# 无需 pygame / C 扩展。安卓端用它做应用内播放，替代不可靠的 `am start` 系统播放器
+# （后者打开音频后默认不自动播放 → 朗读流程在跑却听不到声）。缺失时回退 am start。
+try:
+    import flet_audio as _FTA
+except Exception:  # pragma: no cover
+    _FTA = None
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
@@ -85,6 +97,7 @@ class TTSEngine:
         self.speed = 1.2        # 朗读倍速（1.0~2.0）
         self.voice = "male"     # 音色：male / female（缺省男）
         self._stop_event = None
+        self._audio = None  # flet_audio.Audio 控件（安卓端应用内播放，懒创建）
 
     # ---- 平台判断 ----
     def _is_mobile(self) -> bool:
@@ -98,45 +111,160 @@ class TTSEngine:
         return VOICE_MAP.get(self.voice, VOICE_MAP["male"]).get(lang, VOICE_MAP["male"]["zh"])
 
     # ---- 公开接口 ----
-    async def speak(self, text: str, stop_event) -> float:
-        """朗读 text，返回估算时长（秒）。stop_event 置位时尽快停止。"""
+    async def speak(self, text: str, stop_event, prefetched_path: Optional[str] = None) -> float:
+        """朗读 text，返回估算时长（秒）。stop_event 置位时尽快停止。
+        prefetched_path：已合成好的 mp3 临时文件路径（由 synthesize_to_path 预取），
+        传入可跳过联网合成，实现翻页无缝衔接。"""
         text = (text or "").strip()
         if not text:
             return 0.0
         if self._is_mobile():
-            return await self._speak_mobile(text, stop_event)
-        return await self._speak_edge(text, stop_event)
+            return await self._speak_mobile(text, stop_event, prefetched_path)
+        return await self._speak_edge(text, stop_event, prefetched_path)
 
     def stop(self):
-        # 桌面端：停止 pygame 播放；移动端：关闭本地 HTTP 服务
+        # 桌面端：停止 pygame 播放；移动端：关闭本地 HTTP 服务 + 停止 flet_audio
         self._stop_pygame()
         self._stop_process()
         self._shutdown_server()
+        self._request_flet_audio_stop()
+
+    def _request_flet_audio_stop(self):
+        """异步停止 flet_audio 播放（flet_audio 的 pause/release 是协程，
+        需投到事件循环里执行，避免在同步 stop() 中直接 await）。"""
+        a = self._audio
+        if a is None:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._stop_flet_audio_async(a))
+        except Exception:
+            pass
+
+    async def _stop_flet_audio_async(self, a):
+        try:
+            await a.pause()
+        except Exception:
+            pass
+        try:
+            await a.release()
+        except Exception:
+            pass
+
+    def _get_flet_audio(self):
+        """懒创建并挂载一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。"""
+        if self._audio is None:
+            self._audio = _FTA.Audio(
+                src="",
+                volume=1.0,
+                release_mode=_FTA.ReleaseMode.STOP,
+            )
+            try:
+                self.page.services.append(self._audio)
+                self.page.update()
+            except Exception as ex:
+                print(f"[TTS] 挂载 flet_audio 控件失败: {ex}")
+        return self._audio
+
+    async def _play_flet_audio(self, mp3_path: str, duration: float, stop_event):
+        """用 flet_audio 播放本地 mp3 文件，等待播放结束（或停止信号）。"""
+        audio = self._get_flet_audio()
+        audio.src = mp3_path
+        audio.update()
+        await audio.play()
+        step = 0.1
+        elapsed = 0.0
+        limit = duration + 2.0  # 给真实播放一点余量，避免提前切断尾音
+        while elapsed < limit and not stop_event.is_set():
+            await asyncio.sleep(step)
+            elapsed += step
+        try:
+            await audio.pause()
+        except Exception:
+            pass
+        try:
+            await audio.release()
+        except Exception:
+            pass
+
+    async def synthesize_to_path(self, text: str) -> Optional[str]:
+        """仅合成（不播放），返回临时 mp3 文件路径；失败或移动端返回 None。
+        调用方负责在播放后 unlink 该临时文件。用于翻页前并行预取下一页音频，
+        从而消除翻页后的联网合成等待。"""
+        if self._is_mobile():
+            # 移动端：直接合成到临时文件并返回路径（flet_audio 可播放本地文件，
+            # 翻页前并行预取即可消除联网合成等待，与桌面端一致）。
+            return await self._synthesize_mobile_to_file(text)
+        text = (text or "").strip()
+        if not text:
+            return None
+        if _edge_lite_synthesize is None:
+            return None
+        try:
+            mp3_bytes = await _edge_lite_synthesize(
+                text, self._voice_id(text), _rate_string(self.speed)
+            )
+        except Exception as ex:
+            print(f"[TTS] 预取合成失败: {ex}")
+            return None
+        if not mp3_bytes:
+            return None
+        fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(mp3_bytes)
+        except Exception:
+            try:
+                os.unlink(mp3_path)
+            except Exception:
+                pass
+            return None
+        return mp3_path
 
     # ==================================================================
     # 桌面端：Edge TTS 合成 + pygame 应用内播放
     # ==================================================================
-    async def _speak_edge(self, text: str, stop_event) -> float:
+    async def _speak_edge(self, text: str, stop_event, prefetched_path: Optional[str] = None) -> float:
+        duration = _estimate_duration(text)
+        # 优先使用预取好的音频（翻页前已并行合成），跳过联网等待
+        if prefetched_path and os.path.exists(prefetched_path):
+            try:
+                await self._play_pygame(prefetched_path, stop_event, duration)
+            finally:
+                self._shutdown_server()
+            return duration
+
         if _edge_lite_synthesize is None:
             # websockets 缺失（理论上桌面不会发生）：仅按节奏停顿
-            duration = _estimate_duration(text)
             await self._wait(duration, stop_event)
             return duration
 
-        duration = _estimate_duration(text)
-        mp3 = await _edge_lite_synthesize(
+        mp3_bytes = await _edge_lite_synthesize(
             text, self._voice_id(text), _rate_string(self.speed)
         )
-        if mp3 is None:
+        if mp3_bytes is None:
             await self._wait(duration, stop_event)
             return duration
+        # edge_tts_lite 返回的是 mp3 字节，必须写入临时文件再交给 pygame 播放
+        # （pygame.mixer.music.load 只接受文件路径，直接传字节会报
+        #  "No file 'b'\\xff\\xf3...'"）。
+        fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
         try:
-            await self._play_pygame(mp3, stop_event, duration)
-        finally:
-            self._shutdown_server()
+            with os.fdopen(fd, "wb") as f:
+                f.write(mp3_bytes)
             try:
-                if mp3 and os.path.exists(mp3):
-                    os.unlink(mp3)
+                await self._play_pygame(mp3_path, stop_event, duration)
+            finally:
+                self._shutdown_server()
+                try:
+                    if os.path.exists(mp3_path):
+                        os.unlink(mp3_path)
+                except Exception:
+                    pass
+        finally:
+            try:
+                if os.path.exists(mp3_path):
+                    os.unlink(mp3_path)
             except Exception:
                 pass
         return duration
@@ -210,33 +338,61 @@ class TTSEngine:
     # ==================================================================
     # 移动端：Edge TTS（失败回退 gTTS）+ 本地 HTTP 服务交给系统播放器
     # ==================================================================
-    async def _speak_mobile(self, text: str, stop_event) -> float:
+    async def _speak_mobile(self, text: str, stop_event, prefetched_path=None) -> float:
+        """移动端朗读：优先用 flet_audio 应用内播放（可靠出声）；flet_audio 缺失时
+        回退到本地 HTTP + 系统播放器。prefetched_path 为预取好的 mp3 文件，传给它
+        可跳过联网合成、实现翻页无缝衔接。"""
         duration = _estimate_duration(text)
-        mp3 = await self._synthesize_mobile(text)
+        mp3 = prefetched_path if (prefetched_path and os.path.exists(prefetched_path)) \
+            else await self._synthesize_mobile_to_file(text)
         if mp3 is None:
             await self._wait(duration, stop_event)
             return duration
-        try:
-            self._play_via_local_server(mp3)
-            await self._wait(duration, stop_event)
-        finally:
-            self._shutdown_server()
+        # 优先用 flet_audio 应用内播放（可靠出声）；缺失则回退系统播放器
+        if _FTA is not None:
             try:
-                if mp3 and os.path.exists(mp3):
+                await self._play_flet_audio(mp3, duration, stop_event)
+            except Exception as ex:
+                print(f"[TTS] flet_audio 播放失败，回退系统播放器: {ex}")
+                try:
+                    self._play_via_local_server(mp3)
+                    await self._wait(duration, stop_event)
+                finally:
+                    self._shutdown_server()
+        else:
+            try:
+                self._play_via_local_server(mp3)
+                await self._wait(duration, stop_event)
+            finally:
+                self._shutdown_server()
+        # 清理音频文件：预取文件（prefetched_path）由 _read_all 负责回收，这里只删自行合成的
+        if mp3 != prefetched_path:
+            try:
+                if os.path.exists(mp3):
                     os.unlink(mp3)
             except Exception:
                 pass
         return duration
 
-    async def _synthesize_mobile(self, text: str):
-        """移动端合成：优先 Edge TTS（真实男/女声+倍速），失败回退 gTTS。"""
+    async def _synthesize_mobile_to_file(self, text: str):
+        """移动端合成：优先 Edge TTS（真实男/女声+倍速），失败回退 gTTS；返回 mp3 文件路径。"""
         if _edge_lite_synthesize is not None:
             try:
                 mp3 = await _edge_lite_synthesize(
                     text, self._voice_id(text), _rate_string(self.speed)
                 )
                 if mp3:
-                    return mp3
+                    fd, path = tempfile.mkstemp(suffix=".mp3")
+                    try:
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(mp3)
+                    except Exception:
+                        try:
+                            os.unlink(path)
+                        except Exception:
+                            pass
+                        return None
+                    return path
             except Exception as ex:
                 print(f"[TTS] 安卓 Edge 合成失败，回退 gTTS: {ex}")
         return await self._synthesize_gtts(text)
