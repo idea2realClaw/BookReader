@@ -87,19 +87,32 @@ jobs:
         # 调试：打印 serious-python 提取的 flutter-packages 目录和 pubspec.yaml
         if: always()
         run: |
-          echo "=== build/flutter-packages/ ==="
-          ls -la build/flutter-packages/ 2>&1 || echo "(not found)"
-          find build/flutter-packages/ -name "pubspec.yaml" 2>&1 || true
-          echo ""
-          echo "=== build/flutter/pubspec.yaml (dependencies) ==="
-          if [ -f build/flutter/pubspec.yaml ]; then
-            grep -A 20 "^dependencies:" build/flutter/pubspec.yaml 2>&1 || true
-          else
-            echo "(pubspec.yaml not found)"
-          fi
-          echo ""
-          echo "=== build/site-packages/flutter/ ==="
-          ls -la build/site-packages/flutter/ 2>&1 || echo "(not found - serious-python may not have installed flet_audio)"
+          {
+            echo "=== build/flutter-packages/ ==="
+            ls -la build/flutter-packages/ 2>&1 || echo "(not found)"
+            find build/flutter-packages/ -name "pubspec.yaml" 2>&1 || true
+            echo ""
+            echo "=== build/flutter/pubspec.yaml (dependencies) ==="
+            if [ -f build/flutter/pubspec.yaml ]; then
+              grep -A 30 "^dependencies:" build/flutter/pubspec.yaml 2>&1 || true
+            else
+              echo "(pubspec.yaml not found)"
+            fi
+            echo ""
+            echo "=== build/site-packages/flutter/ ==="
+            ls -la build/site-packages/flutter/ 2>&1 || echo "(not found - serious-python may not have installed flet_audio)"
+            echo ""
+            echo "=== pip list in site-packages ==="
+            ls build/site-packages/ 2>&1 | grep -i "flet\|audio" || echo "(no flet/audio packages found)"
+          } | tee debug_output.txt
+
+      - name: Upload debug output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-output
+          path: debug_output.txt
+          retention-days: 7
 
       - name: Upload APK as artifact
         if: always()
