@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
@@ -50,8 +51,11 @@ class TTSEngine:
         self.page = page
         self._process = None
         self._httpd = None
-        self._pyttsx_engine = None
-        self._pyttsx_lock = threading.Lock()
+        self.speed = 1.0  # 朗读倍速（桌面端生效：驱动 pyttsx3 rate）
+        self._stop_event = None  # 当前朗读会话的停止事件（供回调使用）
+
+    # 桌面端基础语速（rate≈160 接近自然朗读）；实际 rate = BASE_RATE * speed
+    _BASE_RATE = 160
 
     # ---- 平台判断 ----
     def _is_windows(self) -> bool:
@@ -69,6 +73,7 @@ class TTSEngine:
         text = (text or "").strip()
         if not text:
             return 0.0
+        self._stop_event = stop_event
         if self._is_mobile():
             # 移动端（安卓/iOS）走在线 gTTS + 系统播放器
             return await self._speak_gtts(text, stop_event)
@@ -76,56 +81,87 @@ class TTSEngine:
         return await self._speak_desktop(text, stop_event)
 
     def stop(self):
-        # 桌面端 pyttsx3 立即停止当前朗读
-        try:
-            if self._pyttsx_engine is not None:
-                self._pyttsx_engine.stop()
-        except Exception:
-            pass
+        # 桌面端 pyttsx3：停止由 started-word 回调检查 stop_event 触发 eng.stop()，
+        # 无需在此直接操作引擎（引擎位于朗读线程内，外部直接 stop 易死锁）。
+        # 移动端：关闭本地 HTTP 服务与系统播放器进程。
         self._stop_process()
 
     # ---- 桌面端：pyttsx3（离线） ----
-    def _get_pyttsx(self):
-        """懒初始化并缓存 pyttsx3 引擎；不可用（无语音后端）时返回 None。"""
-        if self._pyttsx_engine is not None:
-            return self._pyttsx_engine
-        try:
-            import pyttsx3
-
-            eng = pyttsx3.init()
-            # 语速放缓一点，更接近自然朗读
-            try:
-                eng.setProperty("rate", 175)
-            except Exception:
-                pass
-            self._pyttsx_engine = eng
-            return eng
-        except Exception as ex:
-            print(f"[TTS] pyttsx3 初始化失败（将回退 gTTS）: {ex}")
-            self._pyttsx_engine = False  # 标记失败，避免反复尝试
-            return None
-
     async def _speak_desktop(self, text: str, stop_event) -> float:
-        duration = _estimate_duration(text)
-        eng = self._get_pyttsx()
-        if eng is None:
-            # 离线引擎不可用时回退到在线 gTTS（桌面端也有声）
-            return await self._speak_gtts(text, stop_event)
+        """桌面端离线朗读（Windows SAPI / macOS NSSpeech / Linux espeak）。
 
-        # 按句朗读，便于在句间响应停止事件
-        sentences = re.split(r"(?<=[。！？!?])", text)
-        sentences = [s.strip() for s in sentences if s.strip()]
+        关键修复：pyttsx3 在 worker 线程里用阻塞的 runAndWait() 会与 SAPI 的 COM
+        回调产生时序竞争、偶发死锁（表现为"只有第一句有声/整页卡死"）。因此改用
+        官方非阻塞模式 startLoop(False) + iterate() 在独立线程里轮询，彻底规避
+        阻塞死锁；停止信号由 started-word 回调里的 eng.stop() 触发。
+        """
+        duration = _estimate_duration(text)
+        import pyttsx3
 
         def _run():
-            for s in sentences:
-                if stop_event.is_set():
-                    break
-                with self._pyttsx_lock:
+            try:
+                eng = pyttsx3.init()
+            except Exception as ex:
+                print(f"[TTS] pyttsx3 init 失败（回退 gTTS）: {ex}")
+                return
+            try:
+                try:
+                    eng.setProperty("rate", int(self._BASE_RATE * max(0.5, self.speed)))
+                except Exception:
+                    pass
+
+                # 朗读中收到停止信号则中断当前朗读（回调在 SAPI 工作线程触发，安全）
+                def _on_word(name):
+                    if stop_event.is_set():
+                        try:
+                            eng.stop()
+                        except Exception:
+                            pass
+
+                try:
+                    eng.connect("started-word", _on_word)
+                except Exception:
+                    pass
+
+                # 整段一次性朗读（不再逐句 say，避免 SAPI 逐句重置导致的静音）
+                eng.say(text)
+                try:
+                    # 非阻塞轮询模式（首选，避免线程死锁）
+                    eng.startLoop(False)
+                    while True:
+                        if stop_event.is_set():
+                            try:
+                                eng.stop()
+                            except Exception:
+                                pass
+                            break
+                        try:
+                            busy = eng.isBusy()
+                        except Exception:
+                            busy = False
+                        if not busy:
+                            break
+                        try:
+                            eng.iterate()
+                        except Exception:
+                            break
+                        time.sleep(0.02)
                     try:
-                        eng.say(s)
+                        eng.endLoop()
+                    except Exception:
+                        pass
+                except Exception:
+                    # 极旧 pyttsx3 无 startLoop/iterate：退回阻塞 runAndWait
+                    try:
+                        eng.say(text)
                         eng.runAndWait()
                     except Exception as ex:
-                        print(f"[TTS] pyttsx3 朗读单句错误: {ex}")
+                        print(f"[TTS] pyttsx3 朗读错误: {ex}")
+            finally:
+                try:
+                    eng.stop()
+                except Exception:
+                    pass
 
         try:
             await asyncio.to_thread(_run)

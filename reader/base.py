@@ -29,3 +29,11 @@ class BookReader(ABC):
     def get_page(self, index: int) -> str:
         """Return plain text content for page index."""
         pass
+
+    def get_full_text(self) -> str:
+        """Return the entire book text (used for window-based pagination).
+
+        Default: join all logical pages. Subclasses may override to return
+        the raw decoded text directly.
+        """
+        return "\n".join(self.get_page(i) for i in range(self.get_page_count()))
