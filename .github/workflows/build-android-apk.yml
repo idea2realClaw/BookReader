@@ -64,20 +64,10 @@ jobs:
 
       - name: Build APK
         # --yes 触发 assume_yes，让 flet 自动安装 Flutter/Android SDK 而不弹交互提示
-        # assets/icon.png 和 assets/icon_android.png 会被 flet 自动识别为应用图标
-        # flet_audio 的 dart 包打包机制（flet 0.85.3，经源码验证）：
-        #   1. --source-packages flet_audio 设置 SERIOUS_PYTHON_ALLOW_SOURCE_DISTRIBUTIONS
-        #   2. serious-python 对该包从 sdist（源码分发）安装，而非预编译 wheel
-        #   3. sdist 包含 flutter/flet_audio/ dart 子目录（wheel 不含）
-        #   4. serious-python 把 dart 子目录提取到 flutter-packages-temp/
-        #   5. flet build 扫描 flutter-packages/，注册到 pubspec.yaml
-        #   6. Flutter 构建时下载并编译 flet_audio dart 包 → 打包进 APK
-        # 缺少 --source-packages → serious-python 用 wheel 安装 → 无 dart 子目录 →
-        #   pubspec.yaml 无 flet_audio → APK 不含 dart 端 → service 注册失败 →
-        #   play() 30秒超时 → 听不到声音（v1.0.30 的 APK 仍 68.63MB，与 v1.0.29 相同）
-        # [tool.flet.flutter.dependencies] 在 flet 0.85.3 的 build_base.py 不直接读取，
-        #   保留仅为文档兼容（未来版本可能读取）。
-        # Android 权限通过 pyproject.toml 的 [tool.flet.android.permission] 声明。
+        # --verbose 让 flet build apk 输出详细日志（包括 serious-python 的 pip install 输出）
+        # flet_audio dart 包打包机制：serious-python 安装 flet_audio wheel 后，
+        # 扫描 site-packages/flutter/ 子目录，提取到 flutter-packages-temp/，
+        # flet build 注册到 pubspec.yaml，Flutter 编译时下载 audioplayers 原生库。
         run: |
           cd "${{ github.workspace }}"
           flet build apk \
@@ -90,7 +80,26 @@ jobs:
             --android-adaptive-icon-background "#1565C0" \
             --source-packages flet_audio \
             --skip-flutter-doctor \
+            --verbose \
             --yes
+
+      - name: Debug flutter packages
+        # 调试：打印 serious-python 提取的 flutter-packages 目录和 pubspec.yaml
+        if: always()
+        run: |
+          echo "=== build/flutter-packages/ ==="
+          ls -la build/flutter-packages/ 2>&1 || echo "(not found)"
+          find build/flutter-packages/ -name "pubspec.yaml" 2>&1 || true
+          echo ""
+          echo "=== build/flutter/pubspec.yaml (dependencies) ==="
+          if [ -f build/flutter/pubspec.yaml ]; then
+            grep -A 20 "^dependencies:" build/flutter/pubspec.yaml 2>&1 || true
+          else
+            echo "(pubspec.yaml not found)"
+          fi
+          echo ""
+          echo "=== build/site-packages/flutter/ ==="
+          ls -la build/site-packages/flutter/ 2>&1 || echo "(not found - serious-python may not have installed flet_audio)"
 
       - name: Upload APK as artifact
         if: always()
