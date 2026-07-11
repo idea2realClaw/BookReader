@@ -85,7 +85,6 @@ jobs:
 
       - name: Debug flutter packages
         # 调试：打印 serious-python 提取的 flutter-packages 目录和 pubspec.yaml
-        # 同时写到 $GITHUB_STEP_SUMMARY（Actions 页面直接可见）
         if: always()
         run: |
           {
@@ -112,6 +111,20 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
           cat debug_output.txt >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Push debug output to debug-output branch
+        # 把调试信息推到 debug-output 分支，方便通过 API 读取
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B debug-output
+          cp debug_output.txt DEBUG_OUTPUT.txt
+          git add DEBUG_OUTPUT.txt
+          git commit -m "Update debug output for run ${{ github.run_id }}" || true
+          git push origin debug-output --force 2>&1 || true
 
       - name: Upload debug output
         if: always()
