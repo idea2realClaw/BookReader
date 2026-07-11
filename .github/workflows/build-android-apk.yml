@@ -85,6 +85,7 @@ jobs:
 
       - name: Debug flutter packages
         # 调试：打印 serious-python 提取的 flutter-packages 目录和 pubspec.yaml
+        # 同时写到 $GITHUB_STEP_SUMMARY（Actions 页面直接可见）
         if: always()
         run: |
           {
@@ -92,9 +93,9 @@ jobs:
             ls -la build/flutter-packages/ 2>&1 || echo "(not found)"
             find build/flutter-packages/ -name "pubspec.yaml" 2>&1 || true
             echo ""
-            echo "=== build/flutter/pubspec.yaml (dependencies) ==="
+            echo "=== build/flutter/pubspec.yaml (full) ==="
             if [ -f build/flutter/pubspec.yaml ]; then
-              grep -A 30 "^dependencies:" build/flutter/pubspec.yaml 2>&1 || true
+              cat build/flutter/pubspec.yaml
             else
               echo "(pubspec.yaml not found)"
             fi
@@ -105,6 +106,12 @@ jobs:
             echo "=== pip list in site-packages ==="
             ls build/site-packages/ 2>&1 | grep -i "flet\|audio" || echo "(no flet/audio packages found)"
           } | tee debug_output.txt
+
+          # 写到 step summary（Actions 页面直接可见）
+          echo '## Debug Output' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat debug_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload debug output
         if: always()
