@@ -184,48 +184,47 @@ class TTSEngine:
         """懒创建并注册一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。
         返回 audio。首次创建后需给原生控件一点注册时间再播放。
 
-        关键坑（Flet 0.85.3）：Audio 是 Service 子类，其 init() 会调用
-        context.page._services.register_service(self) 来注册到原生侧。
-        但 init() 在 __post_init__ 时执行，若不在 Flet 事件上下文里
-        （如在后台 asyncio task 中创建），context.page 会抛 RuntimeError
-        被静默吞掉 → service 永远不会注册到原生侧 → 后续 audio.play() 的
-        invoke_method 没有任何监听器响应 → 30 秒 TimeoutException。
-
+        关键坑 1（Flet 0.85.3 Service 注册）：Audio 是 Service 子类，其 init() 会调用
+        context.page._services.register_service(self) 来注册到原生侧。但 init() 在
+        __post_init__ 时执行，若不在 Flet 事件上下文里（如在后台 asyncio task 中创建），
+        context.page 会抛 RuntimeError 被静默吞掉 → service 永远不会注册到原生侧。
         修复：手动调用 page._services.register_service(audio) 注册。
 
-        另一关键坑：flet_audio 的 Python 端（import flet_audio）和 dart 端
-        （AudioService 原生控件）必须同时存在。Python 端通过 requirements.txt
-        安装；dart 端通过 pyproject.toml 的 [tool.flet.flutter.dependencies] 声明。
-        只有 Python 端时，import 成功但原生侧没有 AudioService 类 →
-        register_service 发送的 control 没人处理 → play() 超时。"""
+        关键坑 2（flet_audio dart 端 src 必须非空）：flet_audio 的 dart 端 AudioService.init()
+        会调用 update()，update() 检查 src，src 为空时抛异常 "Audio must have 'src' specified."
+        → AudioService 初始化失败 → 后续 audio.update() / play() 都不会被执行 → 30秒超时。
+        修复：创建 Audio 时设置一个占位符 src（非空），播放时再设置真正的 mp3 路径。
+        占位符 src 会让 _applySource() 异步失败，但不影响 init() 的同步部分
+        （addInvokeMethodListener 在 update() 之前已执行）。播放时设置真正的 src，
+        dart 端 update() 检测到 src 改变，重新调用 _applySource() 加载真正的 mp3。"""
         if self._audio is None:
+            # 占位符 src 必须非空，否则 dart 端 init() 时 update() 会抛异常
+            # 用一个无效 URL 即可，_applySource() 会异步失败但不影响 init()
             self._audio = _FTA.Audio(
-                src="",
+                src="https://placeholder.invalid/silent.mp3",
                 volume=1.0,
                 autoplay=False,
                 release_mode=_FTA.ReleaseMode.STOP,
             )
             try:
                 # 正确注册方式：通过 page._services.register_service()
-                # （page.services.append() 只是把 audio 加到 View.services 列表，
-                #  但该字段有 metadata={"skip": True}，不会被序列化发送到原生侧）
+                # ServiceRegistry 会把 _services 列表（含 audio）序列化发送到原生侧
                 self.page._services.register_service(self._audio)
                 self._audio_just_registered = True
-                # 诊断：确认 service 真的注册到 registry 里
+                # 诊断：确认 service 真的注册到 registry 里（注意是 _services._services）
                 try:
-                    n = len(self.page._services.services) if hasattr(self.page._services, 'services') else '?'
+                    n = len(self.page._services._services)
                     print(f"[TTS] flet_audio service 已注册 (registry size={n})")
+                except Exception as diag_ex:
+                    print(f"[TTS] flet_audio service 已注册 (无法读取 registry size: {diag_ex})")
+                # 诊断：确认 audio 控件的 page 引用和 control ID
+                try:
+                    print(f"[TTS] audio.page={self._audio.page is not None}, audio._i={getattr(self._audio, '_i', '?')}")
                 except Exception:
-                    print("[TTS] flet_audio service 已注册 (无法读取 registry size)")
+                    pass
             except Exception as ex:
                 print(f"[TTS] 注册 flet_audio service 失败: {ex}")
                 print("[TTS] 可能原因：pyproject.toml 缺少 [tool.flet.flutter.dependencies] flet_audio 声明")
-                # 兜底：旧方式（可能无效但保留）
-                try:
-                    self.page.services.append(self._audio)
-                    self.page.update()
-                except Exception:
-                    pass
                 self._audio_just_registered = False
         return self._audio
 
