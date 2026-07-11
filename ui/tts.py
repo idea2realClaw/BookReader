@@ -191,7 +191,13 @@ class TTSEngine:
         被静默吞掉 → service 永远不会注册到原生侧 → 后续 audio.play() 的
         invoke_method 没有任何监听器响应 → 30 秒 TimeoutException。
 
-        修复：手动调用 page._services.register_service(audio) 注册。"""
+        修复：手动调用 page._services.register_service(audio) 注册。
+
+        另一关键坑：flet_audio 的 Python 端（import flet_audio）和 dart 端
+        （AudioService 原生控件）必须同时存在。Python 端通过 requirements.txt
+        安装；dart 端通过 pyproject.toml 的 [tool.flet.flutter.dependencies] 声明。
+        只有 Python 端时，import 成功但原生侧没有 AudioService 类 →
+        register_service 发送的 control 没人处理 → play() 超时。"""
         if self._audio is None:
             self._audio = _FTA.Audio(
                 src="",
@@ -205,8 +211,15 @@ class TTSEngine:
                 #  但该字段有 metadata={"skip": True}，不会被序列化发送到原生侧）
                 self.page._services.register_service(self._audio)
                 self._audio_just_registered = True
+                # 诊断：确认 service 真的注册到 registry 里
+                try:
+                    n = len(self.page._services.services) if hasattr(self.page._services, 'services') else '?'
+                    print(f"[TTS] flet_audio service 已注册 (registry size={n})")
+                except Exception:
+                    print("[TTS] flet_audio service 已注册 (无法读取 registry size)")
             except Exception as ex:
                 print(f"[TTS] 注册 flet_audio service 失败: {ex}")
+                print("[TTS] 可能原因：pyproject.toml 缺少 [tool.flet.flutter.dependencies] flet_audio 声明")
                 # 兜底：旧方式（可能无效但保留）
                 try:
                     self.page.services.append(self._audio)
@@ -251,16 +264,35 @@ class TTSEngine:
             self._audio_just_registered = False
 
         # 设置新的 src 并等待原生侧加载完成（避免 play() 在 source 加载前到达）
+        # 注意：flet 的 getAssetSrc 会用 io.File(src).existsSync() 检查文件是否存在，
+        # 存在则用 setSourceDeviceFile 播放。所以直接传绝对路径是正确的，不要加 file:// 前缀
+        # （加 file:// 会让 io.File("file:///...").existsSync() 返回 false，反而走错分支）。
         audio.src = mp3_path
+        print(f"[TTS] audio.src 已设置: {audio.src}")
+
+        # 监听播放状态变化（诊断用）
+        state_log = []
+        def _on_state_change(e):
+            try:
+                state = e.data if hasattr(e, 'data') else '?'
+            except Exception:
+                state = '?'
+            state_log.append(state)
+            print(f"[TTS] audio on_state_change: {state}")
         try:
-            audio.update()
+            audio.on_state_change = _on_state_change
         except Exception:
             pass
+
+        try:
+            audio.update()
+        except Exception as ex:
+            print(f"[TTS] audio.update() 异常: {ex}")
 
         # 等待 on_loaded 事件（原生 _applySource 完成后触发），最多等 5 秒
         loaded = await self._wait_for_audio_loaded(audio, timeout=5.0)
         if not loaded:
-            print("[TTS] 警告：等待音频加载超时(5s)，仍尝试播放")
+            print("[TTS] 警告：等待音频加载超时(5s)，仍尝试播放（可能 dart 端 flet_audio 未打包进 APK）")
             await asyncio.sleep(0.3)  # 兜底等待
 
         if stop_event.is_set():
@@ -268,6 +300,7 @@ class TTSEngine:
 
         try:
             await audio.play()
+            print("[TTS] audio.play() 已调用（未抛异常）")
         except Exception as ex:
             print(f"[TTS] flet_audio.play() 抛出异常: {ex}")
             raise
@@ -275,9 +308,11 @@ class TTSEngine:
         try:
             await asyncio.sleep(0.4)
             pos = await audio.get_current_position()
-            print(f"[TTS] flet_audio 播放中 position={pos}")
-            if pos is None or (hasattr(pos, 'in_milliseconds') and pos.in_milliseconds == 0):
-                print("[TTS] 警告：play() 已调用但播放位置仍为 0，可能无声（检查 flet_audio 原生插件是否打进 APK）")
+            pos_ms = pos.in_milliseconds if (pos and hasattr(pos, 'in_milliseconds')) else 0
+            print(f"[TTS] flet_audio 播放中 position={pos_ms}ms, state_log={state_log}")
+            if pos_ms == 0:
+                print("[TTS] 警告：play() 已调用但播放位置仍为 0，可能无声")
+                print("[TTS] 可能原因：1) flet_audio dart 包未打进 APK；2) mp3 文件损坏或路径不可达；3) 原生 audioplayers 初始化失败")
         except Exception as ex:
             print(f"[TTS] 读取播放位置失败(非致命): {ex}")
         step = 0.1
@@ -292,6 +327,11 @@ class TTSEngine:
             pass
         try:
             await audio.release()
+        except Exception:
+            pass
+        # 清理状态监听
+        try:
+            audio.on_state_change = None
         except Exception:
             pass
 

@@ -65,6 +65,10 @@ jobs:
       - name: Build APK
         # --yes 触发 assume_yes，让 flet 自动安装 Flutter/Android SDK 而不弹交互提示
         # assets/icon.png 和 assets/icon_android.png 会被 flet 自动识别为应用图标
+        # flet_audio 的 dart 端通过 pyproject.toml 的 [tool.flet.flutter.dependencies] 声明，
+        # flet build apk 会自动把它打进 APK（之前误用 --source-packages flet_audio，
+        # 该参数是"Python 包从源码安装"，不会把 dart 包打进 APK，导致听不到声音）。
+        # Android 权限通过 pyproject.toml 的 [tool.flet.android.permission] 声明。
         run: |
           cd "${{ github.workspace }}"
           flet build apk \
@@ -75,7 +79,6 @@ jobs:
             --build-number "${{ github.run_number }}" \
             --build-version "${{ steps.ver.outputs.version }}" \
             --android-adaptive-icon-background "#1565C0" \
-            --source-packages flet_audio \
             --skip-flutter-doctor \
             --yes
 

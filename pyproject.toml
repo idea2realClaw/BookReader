@@ -8,10 +8,20 @@ product = "BookReader"
 org = "com.bookreader.app"
 description = "A simple and elegant eBook reader"
 
+# Flutter dart 包依赖：flet_audio 的 Python 端通过 requirements.txt 安装，
+# 但 dart 端（AudioService 原生控件）必须在这里声明，flet build apk 才会把它打进 APK。
+# 之前只装了 Python 端 → import flet_audio 成功，但原生侧没有 AudioService 类 →
+# service 注册失败 → play() 30 秒超时 → 听不到声音。
+[tool.flet.flutter.dependencies]
+flet_audio = "*"
+
+# Android 权限声明（flet build apk 会自动注入到 AndroidManifest.xml）。
+# 注意：flet_audio 播放 app 私有目录（FLET_APP_STORAGE_DATA/TEMP）的 mp3 文件
+# 不需要任何存储权限。READ_EXTERNAL_STORAGE 仅为兼容旧版 Android 读取用户选择的 epub。
+# MANAGE_EXTERNAL_STORAGE 已移除：它是特殊权限，不在 Permissions 页面显示，
+# 反而会让用户困惑；app 不需要写 /sdcard/。
 [tool.flet.android.permission]
-"android.permission.WRITE_EXTERNAL_STORAGE" = true
 "android.permission.READ_EXTERNAL_STORAGE" = true
-"android.permission.MANAGE_EXTERNAL_STORAGE" = true
 
 [build-system]
 requires = ["flet"]
