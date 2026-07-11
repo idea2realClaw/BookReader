@@ -110,6 +110,28 @@ class TTSEngine:
         lang = _detect_lang(text)
         return VOICE_MAP.get(self.voice, VOICE_MAP["male"]).get(lang, VOICE_MAP["male"]["zh"])
 
+    # ---- 临时目录（安卓需写到应用私有目录，保证可写可读、flet_audio 能读取）----
+    def _mp3_temp_dir(self) -> str:
+        """返回写 mp3 的临时目录。
+        安卓端优先用 Flet 运行时注入的应用私有临时目录 FLET_APP_STORAGE_TEMP
+        （必定可写可读，不受 scoped storage 限制，flet_audio/ExoPlayer 可正常读取）；
+        其次退回 FLET_APP_STORAGE_DATA；再退回系统临时目录。桌面端用系统临时目录。"""
+        if self._is_mobile():
+            for env_key in ("FLET_APP_STORAGE_TEMP", "FLET_APP_STORAGE_DATA"):
+                d = os.getenv(env_key)
+                if d:
+                    try:
+                        os.makedirs(d, exist_ok=True)
+                        if os.path.isdir(d):
+                            return d
+                    except Exception:
+                        pass
+        return tempfile.gettempdir()
+
+    def _new_mp3_file(self):
+        """在合适目录创建唯一 mp3 文件，返回 (fd, path)。移动端落到应用私有临时目录。"""
+        return tempfile.mkstemp(suffix=".mp3", dir=self._mp3_temp_dir())
+
     # ---- 公开接口 ----
     async def speak(self, text: str, stop_event, prefetched_path: Optional[str] = None) -> float:
         """朗读 text，返回估算时长（秒）。stop_event 置位时尽快停止。
@@ -152,25 +174,40 @@ class TTSEngine:
             pass
 
     def _get_flet_audio(self):
-        """懒创建并挂载一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。"""
+        """懒创建并挂载一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。
+        返回 (audio, just_mounted)。首次挂载后需给原生控件一点注册时间再播放。"""
+        just_mounted = False
         if self._audio is None:
             self._audio = _FTA.Audio(
                 src="",
                 volume=1.0,
+                autoplay=False,
                 release_mode=_FTA.ReleaseMode.STOP,
             )
             try:
                 self.page.services.append(self._audio)
                 self.page.update()
+                just_mounted = True
             except Exception as ex:
                 print(f"[TTS] 挂载 flet_audio 控件失败: {ex}")
-        return self._audio
+        return self._audio, just_mounted
 
     async def _play_flet_audio(self, mp3_path: str, duration: float, stop_event):
         """用 flet_audio 播放本地 mp3 文件，等待播放结束（或停止信号）。"""
-        audio = self._get_flet_audio()
+        try:
+            size = os.path.getsize(mp3_path) if os.path.exists(mp3_path) else -1
+        except Exception:
+            size = -1
+        print(f"[TTS] flet_audio 播放: {mp3_path} (size={size})")
+        audio, just_mounted = self._get_flet_audio()
+        if just_mounted:
+            # 原生 Audio service 首次注册需要一点时间，否则首句可能无声
+            await asyncio.sleep(0.2)
         audio.src = mp3_path
-        audio.update()
+        try:
+            audio.update()
+        except Exception:
+            pass
         await audio.play()
         step = 0.1
         elapsed = 0.0
@@ -209,7 +246,7 @@ class TTSEngine:
             return None
         if not mp3_bytes:
             return None
-        fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+        fd, mp3_path = self._new_mp3_file()
         try:
             with os.fdopen(fd, "wb") as f:
                 f.write(mp3_bytes)
@@ -382,7 +419,7 @@ class TTSEngine:
                     text, self._voice_id(text), _rate_string(self.speed)
                 )
                 if mp3:
-                    fd, path = tempfile.mkstemp(suffix=".mp3")
+                    fd, path = self._new_mp3_file()
                     try:
                         with os.fdopen(fd, "wb") as f:
                             f.write(mp3)
@@ -402,7 +439,7 @@ class TTSEngine:
             return None
         lang = "zh-cn" if _CJK_RE.search(text) else "en"
         try:
-            fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+            fd, mp3_path = self._new_mp3_file()
             os.close(fd)
             # tld="com" 在中国大陆可达（tld="cn" 合成接口返回 404，不可用）
             await asyncio.to_thread(_GTTS(text=text, lang=lang, tld="com").save, mp3_path)

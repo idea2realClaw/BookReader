@@ -142,15 +142,19 @@ class BookViewer(ft.Container):
         )
 
         # 翻页/朗读/倍速栏：用 Stack 绝对定位，钉在浮动日志窗口上方（避免被日志盖住）
+        # 布局：向前翻页键 + 播放键 + 滑块 + 标签 + 音色 靠左成组；page_label 用 expand
+        # 占位把向后翻页键（CHEVRON_RIGHT）推到屏幕最右并保证其完整可见。
+        self.prev_btn = ft.IconButton(ft.Icons.CHEVRON_LEFT, on_click=self.prev_page, icon_size=40, tooltip="上一页")
+        self.next_btn = ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=self.next_page, icon_size=40, tooltip="下一页")
         self.nav_row = ft.Row(
             [
-                ft.IconButton(ft.Icons.CHEVRON_LEFT, on_click=self.prev_page, icon_size=40),
+                self.prev_btn,
                 self.read_btn,
                 self.speed_slider,
                 self.speed_label,
                 self.voice_dd,
                 ft.Container(content=self.page_label, alignment=ft.Alignment.CENTER, expand=True),
-                ft.IconButton(ft.Icons.CHEVRON_RIGHT, on_click=self.next_page, icon_size=40),
+                self.next_btn,
             ],
             alignment=ft.MainAxisAlignment.START,
             height=56,
@@ -476,21 +480,35 @@ class BookViewer(ft.Container):
             self._update_page_display()
 
     def _layout_nav(self):
-        """按屏幕宽度响应化底部控制栏：速度滑块随屏宽缩短，确保最右的向后翻页键
-        始终贴在屏幕最右边、不被挤出屏外。在 __init__ / 窗口缩放 / 日志展开时调用。"""
+        """按屏幕宽度响应化底部控制栏：把播放键、滑块、音色成组靠左，速度滑块随屏宽
+        缩短，并压缩子项间距与两侧箭头图标，确保最右的向后翻页键（CHEVRON_RIGHT）
+        完整贴在屏幕最右边、绝不被挤出屏外。在 __init__ / 窗口缩放 / 日志展开时调用。"""
         w = int(self.ft_page.width or 1400)
-        if w < 480:            # 手机竖屏：紧凑
-            self.speed_slider.width = max(70, int(w * 0.26))
-            self.voice_dd.width = 80
-            self.speed_label.width = 34
+        if w < 480:            # 手机竖屏：极紧凑，保证向后翻页键完整可见
+            # 两侧箭头缩小；播放键靠近向前翻页键；滑块随屏宽；子项间距压到 0
+            self.prev_btn.icon_size = 30
+            self.next_btn.icon_size = 30
+            self.read_btn.icon_size = 30
+            self.speed_slider.width = max(60, int(w * 0.20))
+            self.voice_dd.width = 66
+            self.speed_label.width = 30
+            self.nav_row.spacing = 0
         elif w < 800:          # 小平板 / 窄窗
-            self.speed_slider.width = max(100, int(w * 0.24))
-            self.voice_dd.width = 92
-            self.speed_label.width = 38
+            self.prev_btn.icon_size = 36
+            self.next_btn.icon_size = 36
+            self.read_btn.icon_size = 36
+            self.speed_slider.width = max(90, int(w * 0.22))
+            self.voice_dd.width = 84
+            self.speed_label.width = 36
+            self.nav_row.spacing = 4
         else:                  # 桌面宽窗
+            self.prev_btn.icon_size = 40
+            self.next_btn.icon_size = 40
+            self.read_btn.icon_size = 24
             self.speed_slider.width = 130
             self.voice_dd.width = 110
             self.speed_label.width = 42
+            self.nav_row.spacing = 10
         try:
             self.ft_page.update()
         except Exception:
