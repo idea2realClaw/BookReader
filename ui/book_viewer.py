@@ -99,7 +99,7 @@ class BookViewer(ft.Container):
                 ft.dropdown.Option("male", "男声"),
                 ft.dropdown.Option("female", "女声"),
             ],
-            on_change=self._on_voice,
+            on_select=self._on_voice,
         )
 
         self.header = ft.Row(
