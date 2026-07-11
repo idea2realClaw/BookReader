@@ -74,10 +74,13 @@ BookReader/
 
 - **框架**：Flet 0.85.3
 - **语言**：Python 3.10+
-- **TTS 引擎（双后端）**：
-  - 桌面端：Edge TTS 在线合成（免费、支持中文男/女声、可调倍速、中国大陆可用），并用 pygame 在应用内播放（不调用外部播放器）。
-  - 移动端（Android）：gTTS 在线合成（纯 Python，可在安卓打包环境安装，`.com` 在大陆可达），经本地 HTTP 服务交给系统播放器。受 gTTS 能力限制，移动端音色/倍速控件不生效。
-  - 原因：Flet 安卓二进制包索引缺 edge-tts 依赖的 `multidict`/`frozenlist` 安卓 wheel，故安卓走 gTTS。
+- **TTS 引擎（Edge TTS 统一后端，可打包）**：
+  - 合成：所有平台统一使用 Edge TTS（微软在线语音，免费、支持中文男/女声、可调倍速、中国大陆可用）。
+    由 `ui/edge_tts_lite` 提供——仅依赖 `websockets`+`certifi`（纯 Python，Flet 安卓打包环境可安装），
+    完整复刻 edge_tts 协议，故安卓端也能用男/女声 + 倍速，无需 pyjnius、无需第三方 APK。
+  - 桌面端：pygame 应用内播放（不调用外部播放器）；移动端（Android）：合成 mp3 经本地 HTTP 服务交给系统播放器。
+  - 容错：Edge 合成失败（无网络等）时移动端自动回退 gTTS。
+  - 注：官方 `edge_tts` 包（依赖安卓缺失的 `multidict`/`frozenlist` wheel）与 `pygame` 不列入 requirements，避免 `flet build apk` 失败；桌面端 `flet run` 时可本地 `pip install pygame`。
 - **文件解析**：
   - EPUB：zipfile + html.parser（标准库）
   - PDF：pdfplumber

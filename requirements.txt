@@ -2,8 +2,9 @@ flet>=0.85.0
 pypdf>=6.0.0
 gtts>=2.5.0
 requests>=2.31.0
-# edge-tts 与 pygame 仅用于桌面端（Edge TTS 男/女声+倍速 + pygame 应用内播放），
-# 不列入本文件：flet 的安卓打包环境（pypi.flet.dev）缺少 edge-tts 依赖的
-# multidict/frozenlist 安卓 wheel，且 pygame 无安卓 wheel，都会导致 `flet build apk` 失败。
-# 桌面端用 `flet run` 开发时由本地虚拟环境提供（pip install edge-tts pygame 即可）；
-# 安卓端 tts.py 自动回退到 gTTS（纯 Python，可正常打包，.com 在大陆可达）。
+# Edge TTS 统一后端：ui/edge_tts_lite 仅依赖 websockets + certifi（均为纯 Python，
+# 可在 Flet 安卓打包环境安装），复刻 edge_tts 协议，使安卓端也能用男/女声 + 倍速。
+# 注意：官方 edge_tts / pygame 不列入（其 C 扩展 wheel 在安卓缺失，会导致 flet build apk 失败）；
+# 桌面端 pygame 应用内播放由本地虚拟环境（pip install pygame）提供。
+websockets>=12.0
+certifi>=2024.0.0

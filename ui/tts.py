@@ -1,23 +1,20 @@
 """
-跨平台 TTS 引擎（双后端）。
+跨平台 TTS 引擎（Edge TTS 统一后端，纯 Python 实现，可在安卓打包）。
 
-平台分流：
-- 桌面端（Windows / macOS / Linux）：Edge TTS + pygame 应用内播放。
-  - Edge TTS（微软在线语音）：免费、支持中文男女声、可调语速、在中国大陆可访问。
-    - 男声默认：zh-CN-YunyangNeural；女声默认：zh-CN-XiaoxiaoNeural。
-    - 语速通过 Edge TTS 的 rate 参数控制（如 +20%）。
-  - pygame 在应用内播放合成出的 mp3，不调用任何外部播放器（如 vlc）；
-    倍速滑块通过 pygame 播放频率即时生效。
-- 移动端（Android）：gTTS 在线合成（纯 Python，可在安卓打包环境安装）。
-  - 合成域名优先 translate.google.com（在中国大陆可达）。
-  - 受限于 gTTS 能力，移动端不支持选择音色/语速（控件在安卓端不生效），但朗读正常。
-  - 播放经本地 HTTP 服务（127.0.0.1，绕开 scoped storage，无需 INTERNET 权限）交给系统播放器。
+合成：所有平台统一使用 Edge TTS（微软在线语音），由 ui/edge_tts_lite 提供。
+      edge_tts_lite 仅依赖 websockets（纯 Python，Flet 安卓打包环境可安装），
+      完整复刻 edge_tts 协议，因此安卓端也能用男/女声 + 倍速，
+      且无需 pyjnius、无需第三方 APK（如 ag2s/TTS）、无需官方 edge_tts 包
+      （后者顶层 import aiohttp → 依赖安卓缺失的 multidict/frozenlist wheel）。
+      - 男声默认：zh-CN-YunyangNeural；女声默认：zh-CN-XiaoxiaoNeural。
+      - 语速通过 Edge TTS 的 rate 参数控制（如 +20%）。
 
-为何双后端：Flet 的安卓二进制包索引（pypi.flet.dev）只预编译了 aiohttp / yarl，
-没有 edge-tts 依赖的 multidict / frozenlist（C 扩展），因此 edge-tts 无法在安卓构建
-环境安装；而 gTTS 仅依赖纯 Python 的 requests，可正常打包。桌面端则无此限制。
-
-容错：Edge TTS 合成失败（无网络等）时按估算时长静默停顿，保证朗读节奏正常。
+播放：
+- 桌面端（Windows/macOS/Linux）：pygame 应用内播放，不调用外部播放器（如 vlc）。
+- 移动端（Android）：合成的 mp3 经本地 HTTP 服务（127.0.0.1，无需 INTERNET 权限）
+  交给系统播放器播放。
+容错：Edge 合成失败（无网络等）时，移动端回退 gTTS，桌面端按估算时长静默停顿，
+      保证朗读节奏正常。
 """
 
 import asyncio
@@ -28,13 +25,13 @@ import tempfile
 import threading
 import time
 
-# Edge TTS（桌面端使用；安卓打包环境无对应 wheel，故做可选导入）
+# Edge TTS 轻量客户端（纯 Python，可打包）。若 websockets 缺失则为本模块导入失败时置 None。
 try:
-    import edge_tts
-except Exception:  # pragma: no cover - 安卓端通常未安装
-    edge_tts = None
+    from .edge_tts_lite import synthesize as _edge_lite_synthesize
+except Exception:  # pragma: no cover - websockets 缺失时
+    _edge_lite_synthesize = None
 
-# gTTS（移动端使用；纯 Python，可打包）
+# gTTS 仅作为移动端 Edge 合成失败时的兜底
 try:
     from gtts import gTTS as _GTTS
 except Exception:  # pragma: no cover
@@ -42,7 +39,7 @@ except Exception:  # pragma: no cover
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
-# 音色映射：男 / 女（缺省男）。每种语言给出 Edge TTS 标准神经语音（仅桌面端生效）。
+# 音色映射：男 / 女（缺省男）。各种语言给出 Edge TTS 标准神经语音。
 VOICE_MAP = {
     "male": {
         "zh": "zh-CN-YunyangNeural",      # 云扬（男）
@@ -85,8 +82,8 @@ class TTSEngine:
         self.page = page
         self._process = None
         self._httpd = None
-        self.speed = 1.2        # 朗读倍速（1.0~2.0，仅桌面端 Edge TTS 生效）
-        self.voice = "male"     # 音色：male / female（缺省男，仅桌面端 Edge TTS 生效）
+        self.speed = 1.2        # 朗读倍速（1.0~2.0）
+        self.voice = "male"     # 音色：male / female（缺省男）
         self._stop_event = None
 
     # ---- 平台判断 ----
@@ -106,9 +103,8 @@ class TTSEngine:
         text = (text or "").strip()
         if not text:
             return 0.0
-        # 按平台分流：移动端走 gTTS，桌面端走 Edge TTS
         if self._is_mobile():
-            return await self._speak_gtts(text, stop_event)
+            return await self._speak_mobile(text, stop_event)
         return await self._speak_edge(text, stop_event)
 
     def stop(self):
@@ -121,46 +117,29 @@ class TTSEngine:
     # 桌面端：Edge TTS 合成 + pygame 应用内播放
     # ==================================================================
     async def _speak_edge(self, text: str, stop_event) -> float:
-        if edge_tts is None:
-            # 桌面端未安装 edge_tts（理论上不会发生）：仅按节奏停顿
+        if _edge_lite_synthesize is None:
+            # websockets 缺失（理论上桌面不会发生）：仅按节奏停顿
             duration = _estimate_duration(text)
             await self._wait(duration, stop_event)
             return duration
 
         duration = _estimate_duration(text)
-        mp3_path = await self._synthesize_edge(text)
-        if mp3_path is None:
+        mp3 = await _edge_lite_synthesize(
+            text, self._voice_id(text), _rate_string(self.speed)
+        )
+        if mp3 is None:
             await self._wait(duration, stop_event)
             return duration
         try:
-            await self._play_pygame(mp3_path, stop_event, duration)
+            await self._play_pygame(mp3, stop_event, duration)
         finally:
             self._shutdown_server()
             try:
-                if mp3_path and os.path.exists(mp3_path):
-                    os.unlink(mp3_path)
+                if mp3 and os.path.exists(mp3):
+                    os.unlink(mp3)
             except Exception:
                 pass
         return duration
-
-    async def _synthesize_edge(self, text: str) -> str | None:
-        voice = self._voice_id(text)
-        rate = _rate_string(self.speed)
-        try:
-            fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
-            os.close(fd)
-            comm = edge_tts.Communicate(text=text, voice=voice, rate=rate)
-            await comm.save(mp3_path)
-            print(f"[TTS] Edge TTS 合成成功 voice={voice} rate={rate}")
-            return mp3_path
-        except Exception as ex:
-            print(f"[TTS] Edge TTS 合成失败（可能无网络）: {ex}")
-            try:
-                if "mp3_path" in dir() and os.path.exists(mp3_path):
-                    os.unlink(mp3_path)
-            except Exception:
-                pass
-            return None
 
     async def _play_pygame(self, mp3_path: str, stop_event, duration: float):
         try:
@@ -229,39 +208,48 @@ class TTSEngine:
             pass
 
     # ==================================================================
-    # 移动端：gTTS 合成 + 本地 HTTP 服务交给系统播放器
+    # 移动端：Edge TTS（失败回退 gTTS）+ 本地 HTTP 服务交给系统播放器
     # ==================================================================
-    async def _speak_gtts(self, text: str, stop_event) -> float:
-        if _GTTS is None:
-            duration = _estimate_duration(text)
-            await self._wait(duration, stop_event)
-            return duration
-
+    async def _speak_mobile(self, text: str, stop_event) -> float:
         duration = _estimate_duration(text)
-        mp3_path = await self._synthesize_gtts(text)
-        if mp3_path is None:
+        mp3 = await self._synthesize_mobile(text)
+        if mp3 is None:
             await self._wait(duration, stop_event)
             return duration
         try:
-            self._play_via_local_server(mp3_path)
+            self._play_via_local_server(mp3)
             await self._wait(duration, stop_event)
         finally:
             self._shutdown_server()
             try:
-                if mp3_path and os.path.exists(mp3_path):
-                    os.unlink(mp3_path)
+                if mp3 and os.path.exists(mp3):
+                    os.unlink(mp3)
             except Exception:
                 pass
         return duration
 
-    async def _synthesize_gtts(self, text: str) -> str | None:
+    async def _synthesize_mobile(self, text: str):
+        """移动端合成：优先 Edge TTS（真实男/女声+倍速），失败回退 gTTS。"""
+        if _edge_lite_synthesize is not None:
+            try:
+                mp3 = await _edge_lite_synthesize(
+                    text, self._voice_id(text), _rate_string(self.speed)
+                )
+                if mp3:
+                    return mp3
+            except Exception as ex:
+                print(f"[TTS] 安卓 Edge 合成失败，回退 gTTS: {ex}")
+        return await self._synthesize_gtts(text)
+
+    async def _synthesize_gtts(self, text: str):
+        if _GTTS is None:
+            return None
         lang = "zh-cn" if _CJK_RE.search(text) else "en"
         try:
             fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
             os.close(fd)
             # tld="com" 在中国大陆可达（tld="cn" 合成接口返回 404，不可用）
             await asyncio.to_thread(_GTTS(text=text, lang=lang, tld="com").save, mp3_path)
-            print(f"[TTS] gTTS 合成成功 lang={lang}")
             return mp3_path
         except Exception as ex:
             print(f"[TTS] gTTS 合成失败: {ex}")
