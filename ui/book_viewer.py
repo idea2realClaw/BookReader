@@ -261,7 +261,7 @@ class BookViewer(ft.Container):
         if not text or not text.strip():
             return []
         res = []
-        for m in self._SENT_RE.finditer(text):
+        for m in _SENT_RE.finditer(text):
             s = m.group(1).strip()
             if s:
                 res.append((s, m.start(1)))
@@ -612,6 +612,10 @@ class BookViewer(ft.Container):
             else:
                 data = {"books": []}
 
+            # 兼容旧版顶层 list 格式，统一为 {"books": [...]}
+            if isinstance(data, list):
+                data = {"books": data}
+
             book_path = ""
             if hasattr(self.reader, "path"):
                 book_path = self.reader.path
@@ -655,6 +659,22 @@ class BookViewer(ft.Container):
             with open(BOOKS_JSON_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
+            # 迁移：旧版把书籍直接存为顶层 list；新版本统一包在 {"books": [...]} 下。
+            # 检测到旧格式时自动归一化并写回，避免丢失已有记录。
+            if isinstance(data, list):
+                data = {"books": data}
+                try:
+                    with open(BOOKS_JSON_PATH, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    print(f"[BookViewer] 已将旧版 books.json 迁移为新格式")
+                except Exception:
+                    pass
+
+            # 防御：books.json 可能因旧版本/损坏而结构不符
+            if not isinstance(data, dict) or not isinstance(data.get("books"), list):
+                print(f"[BookViewer] books.json 结构不符，忽略旧位置")
+                return
+
             book_path = ""
             if hasattr(self.reader, "path"):
                 book_path = self.reader.path
@@ -662,6 +682,8 @@ class BookViewer(ft.Container):
                 return
 
             for book in data["books"]:
+                if not isinstance(book, dict):
+                    continue
                 if book["path"] == book_path:
                     if "char_offset" in book and book["char_offset"] is not None:
                         self._resume_char_offset = int(book["char_offset"])
