@@ -1,15 +1,16 @@
 """
 跨平台 TTS 引擎。
 
-- Windows 桌面：使用系统 SAPI（VBScript + cscript），离线、无需联网。
-- Android / iOS / Linux / macOS：使用 gTTS 在线合成语音，再尝试播放。
+- 桌面端（Windows / Linux / macOS）：优先使用 pyttsx3 离线引擎
+  （Windows 走系统 SAPI、macOS 走 NSSpeech、Linux 走 espeak），无需联网、稳定出声。
+- 移动端（Android / iOS）：flet 0.85.3 没有内置音频控件，且安卓受 scoped storage
+  限制，纯 Python 无法可靠地把应用私有目录的音频交给系统播放器。
+  因此安卓端用 gTTS 在线合成 mp3，经本地 HTTP 服务（127.0.0.1，绕开 scoped storage，
+  无需 INTERNET 权限）交给系统播放器播放；若合成失败则按估算时长静默停顿，
+  保证朗读节奏正常（不会瞬间翻页）。
 
-说明：
-flet 0.85.3 没有内置音频播放控件，且安卓受 scoped storage 限制，
-纯 Python 无法可靠地把应用私有目录的音频交给系统播放器。
-因此安卓端若 `am start` 无法出声，本模块会按估算时长 sleep，
-保证朗读节奏正常（不会瞬间翻页），并把合成结果交给系统尝试播放。
-如需安卓稳定出声，应接入 Flutter 原生 `flutter_tts`（自定义控件）。
+说明：安卓端"稳定、应用内可停止的原生朗读"需要 Flutter 原生 flutter_tts 控件
+（自定义 Dart 桥接），纯 Python 方案为尽力而为。
 """
 
 import asyncio
@@ -18,7 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
@@ -48,7 +49,9 @@ class TTSEngine:
     def __init__(self, page=None):
         self.page = page
         self._process = None
-        self._httpd = None  # 安卓本地 HTTP 服务（播放用）
+        self._httpd = None
+        self._pyttsx_engine = None
+        self._pyttsx_lock = threading.Lock()
 
     # ---- 平台判断 ----
     def _is_windows(self) -> bool:
@@ -66,57 +69,71 @@ class TTSEngine:
         text = (text or "").strip()
         if not text:
             return 0.0
-        if self._is_windows():
-            return await self._speak_windows(text, stop_event)
-        return await self._speak_gtts(text, stop_event)
+        if self._is_mobile():
+            # 移动端（安卓/iOS）走在线 gTTS + 系统播放器
+            return await self._speak_gtts(text, stop_event)
+        # 桌面端优先离线 pyttsx3
+        return await self._speak_desktop(text, stop_event)
 
     def stop(self):
+        # 桌面端 pyttsx3 立即停止当前朗读
+        try:
+            if self._pyttsx_engine is not None:
+                self._pyttsx_engine.stop()
+        except Exception:
+            pass
         self._stop_process()
 
-    # ---- Windows: SAPI ----
-    async def _speak_windows(self, text: str, stop_event) -> float:
+    # ---- 桌面端：pyttsx3（离线） ----
+    def _get_pyttsx(self):
+        """懒初始化并缓存 pyttsx3 引擎；不可用（无语音后端）时返回 None。"""
+        if self._pyttsx_engine is not None:
+            return self._pyttsx_engine
         try:
-            await asyncio.to_thread(self._speak_with_cscript, text, stop_event)
-            return _estimate_duration(text)
-        except Exception as ex:
-            print(f"[TTS] Windows SAPI 错误: {ex}")
-            await asyncio.sleep(1.0)
-            return _estimate_duration(text)
+            import pyttsx3
 
-    def _speak_with_cscript(self, text: str, stop_event):
-        import tempfile as _tf
-        safe = text[:200].replace('"', "'").replace("\n", " ").replace("\r", " ")
-        vbs = (
-            'Set speak = CreateObject("SAPI.SpVoice")\n'
-            'speak.Rate = 2\n'
-            f'speak.Speak "{safe}"\n'
-        )
-        fd, vbs_path = _tf.mkstemp(suffix=".vbs")
-        with os.fdopen(fd, "w", encoding="ansi") as f:
-            f.write(vbs)
-        try:
-            self._process = subprocess.Popen(
-                ["cscript", "//nologo", vbs_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            while self._process.poll() is None:
-                if stop_event.is_set():
-                    self._process.terminate()
-                    try:
-                        self._process.wait(timeout=1)
-                    except Exception:
-                        self._process.kill()
-                    break
-                time.sleep(0.1)
-        finally:
-            self._process = None
+            eng = pyttsx3.init()
+            # 语速放缓一点，更接近自然朗读
             try:
-                os.unlink(vbs_path)
+                eng.setProperty("rate", 175)
             except Exception:
                 pass
+            self._pyttsx_engine = eng
+            return eng
+        except Exception as ex:
+            print(f"[TTS] pyttsx3 初始化失败（将回退 gTTS）: {ex}")
+            self._pyttsx_engine = False  # 标记失败，避免反复尝试
+            return None
 
-    # ---- 其它平台: gTTS ----
+    async def _speak_desktop(self, text: str, stop_event) -> float:
+        duration = _estimate_duration(text)
+        eng = self._get_pyttsx()
+        if eng is None:
+            # 离线引擎不可用时回退到在线 gTTS（桌面端也有声）
+            return await self._speak_gtts(text, stop_event)
+
+        # 按句朗读，便于在句间响应停止事件
+        sentences = re.split(r"(?<=[。！？!?])", text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+        def _run():
+            for s in sentences:
+                if stop_event.is_set():
+                    break
+                with self._pyttsx_lock:
+                    try:
+                        eng.say(s)
+                        eng.runAndWait()
+                    except Exception as ex:
+                        print(f"[TTS] pyttsx3 朗读单句错误: {ex}")
+
+        try:
+            await asyncio.to_thread(_run)
+        except Exception as ex:
+            print(f"[TTS] pyttsx3 线程错误: {ex}")
+        return duration
+
+    # ---- 移动端：gTTS 在线合成 + 系统播放器 ----
     async def _speak_gtts(self, text: str, stop_event) -> float:
         duration = _estimate_duration(text)
         try:
@@ -132,7 +149,7 @@ class TTSEngine:
             os.close(fd)
             gTTS(text=text, lang=_detect_lang(text)).save(mp3_path)
         except Exception as ex:
-            print(f"[TTS] gTTS 合成失败: {ex}")
+            print(f"[TTS] gTTS 合成失败（可能无网络）: {ex}")
             await self._wait(duration, stop_event)
             return duration
 
@@ -147,6 +164,7 @@ class TTSEngine:
         except Exception as ex:
             print(f"[TTS] 播放启动失败: {ex}")
 
+        # 等整页朗读时长（让系统播放器有足够时间播放），再清理
         await self._wait(duration, stop_event)
 
         # 清理：关闭本地服务并删除临时文件
@@ -160,11 +178,10 @@ class TTSEngine:
 
     def _play_via_local_server(self, mp3_path: str):
         """安卓：起一个本地 HTTP 服务托管 mp3，再让系统播放器打开该 URL。"""
-        import http.server
-        import socketserver
-        import socket
         import functools
-        import threading
+        import http.server
+        import socket
+        import socketserver
 
         directory = os.path.dirname(mp3_path)
         fname = os.path.basename(mp3_path)
@@ -213,7 +230,6 @@ class TTSEngine:
 
     def _launch_player(self, mp3_path: str):
         if self._is_mobile():
-            # 安卓：尝试用系统播放器打开（部分机型/目录可能无权限）
             self._process = subprocess.Popen(
                 [
                     "am", "start",
@@ -221,8 +237,7 @@ class TTSEngine:
                     "-t", "audio/mpeg",
                     "-d", f"file://{mp3_path}",
                 ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         elif sys.platform == "darwin":
             self._process = subprocess.Popen(
@@ -230,17 +245,10 @@ class TTSEngine:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         else:
-            # Linux：优先 mpg123，否则 xdg-open
-            player = "mpg123" if self._has("mpg123") else "xdg-open"
             self._process = subprocess.Popen(
-                [player, mp3_path],
+                ["xdg-open", mp3_path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-
-    @staticmethod
-    def _has(cmd: str) -> bool:
-        from shutil import which
-        return which(cmd) is not None
 
     async def _wait(self, duration: float, stop_event):
         elapsed = 0.0
