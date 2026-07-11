@@ -180,7 +180,7 @@ class TTSEngine:
         except Exception:
             pass
 
-    def _get_flet_audio(self):
+    def _get_flet_audio(self, initial_src: str = "", on_loaded=None, on_state_change=None):
         """懒创建并注册一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。
         返回 audio。首次创建后需给原生控件一点注册时间再播放。
 
@@ -190,22 +190,38 @@ class TTSEngine:
         context.page 会抛 RuntimeError 被静默吞掉 → service 永远不会注册到原生侧。
         修复：手动调用 page._services.register_service(audio) 注册。
 
-        关键坑 2（flet_audio dart 端 src 必须非空）：flet_audio 的 dart 端 AudioService.init()
-        会调用 update()，update() 检查 src，src 为空时抛异常 "Audio must have 'src' specified."
-        → AudioService 初始化失败 → 后续 audio.update() / play() 都不会被执行 → 30秒超时。
-        修复：创建 Audio 时设置一个占位符 src（非空），播放时再设置真正的 mp3 路径。
-        占位符 src 会让 _applySource() 异步失败，但不影响 init() 的同步部分
-        （addInvokeMethodListener 在 update() 之前已执行）。播放时设置真正的 src，
-        dart 端 update() 检测到 src 改变，重新调用 _applySource() 加载真正的 mp3。"""
+        关键坑 2（flet_audio dart 端 src 必须非空且必须是真实可达路径）：
+        flet_audio 的 dart 端 AudioService.init() 会调用 update()，update() 检查 src，
+        src 为空时抛异常 "Audio must have 'src' specified." → AudioService 初始化失败
+        → 后续 audio.update() / play() 都不会被执行 → 30秒超时。
+        
+        修复（v1.0.35）：创建 Audio 时直接用真实 mp3 文件路径作为 initial_src。
+        **不能用占位符 URL**（如 https://placeholder.invalid/silent.mp3）！因为 dart 端
+        init() → update() → _applySource() 会立即尝试加载 src，占位符 URL 网络请求失败后
+        audio_player 会进入 error 状态，后续设置真实 mp3 路径时 on_loaded 永远不会触发。
+        用真实本地 mp3 路径，dart 端 _applySource() 会用 setSourceDeviceFile 加载本地文件，
+        加载成功后触发 on_loaded 事件，audio_player 进入 ready 状态，后续 play() 才能工作。
+
+        关键坑 3（on_loaded 事件可能在设置回调之前触发）：
+        register_service 可能把 audio 控件立即发送到原生侧，dart 端 init() → _applySource()
+        可能在 Python 端设置 on_loaded 回调之前就完成。所以 on_loaded 回调必须在创建 Audio
+        时就传入（通过 Audio.__init__ 的 on_loaded 参数），不能在创建后再设置。"""
         if self._audio is None:
-            # 占位符 src 必须非空，否则 dart 端 init() 时 update() 会抛异常
-            # 用一个无效 URL 即可，_applySource() 会异步失败但不影响 init()
-            self._audio = _FTA.Audio(
-                src="https://placeholder.invalid/silent.mp3",
+            if not initial_src:
+                raise ValueError("首次创建 Audio 必须传入 initial_src（真实 mp3 文件路径）")
+            # 创建 Audio 时直接用真实 mp3 路径（不能用占位符 URL！）
+            # on_loaded 回调必须在创建时就传入，避免错过 dart 端 init() 触发的事件
+            kwargs = dict(
+                src=initial_src,
                 volume=1.0,
                 autoplay=False,
                 release_mode=_FTA.ReleaseMode.STOP,
             )
+            if on_loaded is not None:
+                kwargs["on_loaded"] = on_loaded
+            if on_state_change is not None:
+                kwargs["on_state_change"] = on_state_change
+            self._audio = _FTA.Audio(**kwargs)
             try:
                 # 正确注册方式：通过 page._services.register_service()
                 # ServiceRegistry 会把 _services 列表（含 audio）序列化发送到原生侧
@@ -255,19 +271,18 @@ class TTSEngine:
         except Exception:
             size = -1
         print(f"[TTS] flet_audio 播放: {mp3_path} (size={size})")
-        audio = self._get_flet_audio()
-        just_registered = getattr(self, "_audio_just_registered", False)
-        if just_registered:
-            # 原生 Audio service 首次注册需要一点时间，否则首句可能无声
-            await asyncio.sleep(0.5)
-            self._audio_just_registered = False
+        is_first_play = (self._audio is None)
 
-        # 设置新的 src 并等待原生侧加载完成（避免 play() 在 source 加载前到达）
-        # 注意：flet 的 getAssetSrc 会用 io.File(src).existsSync() 检查文件是否存在，
-        # 存在则用 setSourceDeviceFile 播放。所以直接传绝对路径是正确的，不要加 file:// 前缀
-        # （加 file:// 会让 io.File("file:///...").existsSync() 返回 false，反而走错分支）。
-        audio.src = mp3_path
-        print(f"[TTS] audio.src 已设置: {audio.src}")
+        # 创建 on_loaded future（必须在创建/更新 audio 之前设置回调）
+        # 原因：register_service 可能把 audio 立即发送到原生侧，dart 端 init() → _applySource()
+        # 可能在 Python 端设置 on_loaded 回调之前就完成，导致事件丢失。
+        loop = asyncio.get_event_loop()
+        loaded_future = loop.create_future()
+
+        def _on_loaded(e):
+            print(f"[TTS] audio on_loaded 事件触发")
+            if not loaded_future.done():
+                loaded_future.set_result(True)
 
         # 监听播放状态变化（诊断用）
         state_log = []
@@ -278,21 +293,60 @@ class TTSEngine:
                 state = '?'
             state_log.append(state)
             print(f"[TTS] audio on_state_change: {state}")
-        try:
-            audio.on_state_change = _on_state_change
-        except Exception:
-            pass
 
-        try:
-            audio.update()
-        except Exception as ex:
-            print(f"[TTS] audio.update() 异常: {ex}")
+        if is_first_play:
+            # 第一次创建：直接用真实 mp3 路径作为 initial_src，并在创建时设置 on_loaded 回调
+            # 这样 dart 端 init() → _applySource(mp3_path) 加载本地文件 → on_loaded 触发
+            audio = self._get_flet_audio(
+                initial_src=mp3_path,
+                on_loaded=_on_loaded,
+                on_state_change=_on_state_change,
+            )
+            just_registered = getattr(self, "_audio_just_registered", False)
+            if just_registered:
+                # 原生 Audio service 首次注册需要一点时间，否则首句可能无声
+                await asyncio.sleep(0.5)
+                self._audio_just_registered = False
+            print(f"[TTS] 首次播放，audio.src 已在创建时设置: {audio.src}")
+            # 第一次创建时 src 已经是 mp3_path，但还需要 audio.update() 触发 dart 端 update()
+            # （register_service 可能已经发送，但 on_state_change 等属性可能需要 update 同步）
+            try:
+                audio.update()
+            except Exception as ex:
+                print(f"[TTS] audio.update() 异常: {ex}")
+        else:
+            audio = self._get_flet_audio()
+            # 设置回调
+            try:
+                audio.on_loaded = _on_loaded
+                audio.on_state_change = _on_state_change
+            except Exception:
+                pass
+            # 后续播放，更新 src 并等待原生侧加载完成
+            # 注意：flet 的 getAssetSrc 会用 io.File(src).existsSync() 检查文件是否存在，
+            # 存在则用 setSourceDeviceFile 播放。所以直接传绝对路径是正确的，不要加 file:// 前缀
+            # （加 file:// 会让 io.File("file:///...").existsSync() 返回 false，反而走错分支）。
+            audio.src = mp3_path
+            print(f"[TTS] audio.src 已设置: {audio.src}")
+            try:
+                audio.update()
+            except Exception as ex:
+                print(f"[TTS] audio.update() 异常: {ex}")
 
         # 等待 on_loaded 事件（原生 _applySource 完成后触发），最多等 5 秒
-        loaded = await self._wait_for_audio_loaded(audio, timeout=5.0)
-        if not loaded:
-            print("[TTS] 警告：等待音频加载超时(5s)，仍尝试播放（可能 dart 端 flet_audio 未打包进 APK）")
+        try:
+            await asyncio.wait_for(loaded_future, timeout=5.0)
+            print("[TTS] 音频已加载（on_loaded 触发）")
+        except asyncio.TimeoutError:
+            print("[TTS] 警告：等待音频加载超时(5s)，仍尝试播放")
+            print("[TTS] 可能原因：1) mp3 文件损坏或路径不可达；2) 原生 audioplayers 加载失败；3) dart 端 _applySource 异常")
             await asyncio.sleep(0.3)  # 兜底等待
+        finally:
+            # 清理 on_loaded 回调，避免重复触发
+            try:
+                audio.on_loaded = None
+            except Exception:
+                pass
 
         if stop_event.is_set():
             return
@@ -311,7 +365,7 @@ class TTSEngine:
             print(f"[TTS] flet_audio 播放中 position={pos_ms}ms, state_log={state_log}")
             if pos_ms == 0:
                 print("[TTS] 警告：play() 已调用但播放位置仍为 0，可能无声")
-                print("[TTS] 可能原因：1) flet_audio dart 包未打进 APK；2) mp3 文件损坏或路径不可达；3) 原生 audioplayers 初始化失败")
+                print("[TTS] 可能原因：1) mp3 文件损坏或路径不可达；2) 原生 audioplayers 初始化失败；3) audio_player 处于 error 状态")
         except Exception as ex:
             print(f"[TTS] 读取播放位置失败(非致命): {ex}")
         step = 0.1
