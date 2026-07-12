@@ -665,8 +665,21 @@ class BookViewer(ft.Container):
         - 逐句高亮等待以"真实音频播完"为准（done_task），估算时长偏长时提前结束，
           消除翻页前的静音停顿。
         """
+        # ---- ping-pong 双缓冲朗读（v1.0.41）----
+        # 第 1 段：完全沿用"首段方法"（创建 Audio + 加载）完整播放，保持不变。
+        # 第 2 段起：两个固定缓冲文件 tmpbookreader1/2.mp3 交替——
+        #   不等上段播完就并行合成下一段到"另一缓冲"，删掉已读完的旧文件，
+        #   再按首段方法完整播放新缓冲；如此交替，直到读完。
+        tmp_dir = self.tts._mp3_temp_dir()
+        buf_paths = [
+            os.path.join(tmp_dir, "tmpbookreader1.mp3"),
+            os.path.join(tmp_dir, "tmpbookreader2.mp3"),
+        ]
         first_page = True
-        prefetch_tasks = {}  # page_index -> 预取任务（synthesize_to_path 的 Task）
+        first_seg = True        # 仅第 1 段为 True（走创建 Audio 的首段方法）
+        last_synth_idx = 0     # 上一次合成写入的缓冲下标（即"当前段音频"所在缓冲）
+        pending = None          # 下一段的并行合成任务
+        free_idx = -1          # 该任务写入的缓冲下标
         while self._is_reading and not self._tts_stop_event.is_set():
             try:
                 # 获取当前页文本（窗口分页后的可视页）
@@ -698,32 +711,60 @@ class BookViewer(ft.Container):
                 first_page = False
 
                 if start_idx <= 0:
-                    # 从本页第一句开始：整页一次性朗读（安卓端只触发一次系统播放器）
+                    # 从本页第一句开始：整页一次性朗读
                     speak_text = text
                     local_base = 0
                 else:
-                    # 从选中句开始：拼接选中句及之后所有句；local_base 为选中句偏移
+                    # 从选中句开始：拼接选中句及之后所有句
                     speak_text = text[sentences[start_idx][1]:]
                     local_base = sentences[start_idx][1]
 
                 durations = [estimate_duration(s) for s, _ in sentences]
 
-                # 取本页预取音频（上一页播放时已并行合成好）
-                pf_task = prefetch_tasks.pop(self.current, None)
-                prefetched = await pf_task if pf_task is not None else None
+                # 第 1 段：合成到 buf[0] 并完整播放（首段方法，完全不变）
+                if first_seg:
+                    mp3 = await self.tts.synthesize_to_path_named(speak_text, buf_paths[0])
+                    if mp3 is None:
+                        # 合成失败：按估算时长静默停顿后翻页
+                        await self._wait(durations[0] if durations else 0.0, self._tts_stop_event)
+                        if self._tts_stop_event.is_set():
+                            break
+                        if self.current < len(self.pages) - 1:
+                            self.current += 1
+                            self._update_page_display()
+                        else:
+                            break
+                        continue
+                    last_synth_idx = 0
+                else:
+                    # 后续段：当前段音频已由上一次并行合成写入 buf[last_synth_idx]
+                    mp3 = buf_paths[last_synth_idx]
+                    # 删掉"已读完的旧文件"——另一个缓冲（上上段所在，已播放完毕）
+                    old_idx = 1 - last_synth_idx
+                    if os.path.exists(buf_paths[old_idx]):
+                        try:
+                            os.unlink(buf_paths[old_idx])
+                            print(f"[BookViewer] 已删除旧缓冲 tmpbookreader{old_idx + 1}.mp3")
+                        except Exception:
+                            pass
 
-                # 预取下一页（与播放本页并行，翻页后无需再联网等待）
+                # 并行合成"下一段"到空闲缓冲（不等当前段播完），翻页后直接播放
                 nxt = self.current + 1
-                if nxt < len(self.pages) and nxt not in prefetch_tasks:
-                    prefetch_tasks[nxt] = asyncio.create_task(
-                        self.tts.synthesize_to_path(self.pages[nxt])
+                if nxt < len(self.pages):
+                    free_idx = 1 - last_synth_idx
+                    pending = asyncio.create_task(
+                        self.tts.synthesize_to_path_named(self.pages[nxt], buf_paths[free_idx])
                     )
+                else:
+                    pending = None
+                    free_idx = -1
 
-                # 整段一次性朗读（桌面端稳定；安卓端一次系统播放器）
-                speak_task = asyncio.create_task(self._speak_text(speak_text, prefetched_path=prefetched))
+                # 完整播放当前段 mp3：第 1 段用"创建 Audio"的首段方法，后续段用重载路径
+                speak_task = asyncio.create_task(
+                    self._speak_text_from_file(speak_text, mp3, is_first=first_seg)
+                )
 
-                # 按估算时长逐句高亮，与朗读节奏大致同步；同时记录每句位置。
-                # 一旦整页音频播完（speak_task 完成）即提前结束等待，避免估算偏长造成静音。
+                # 逐句高亮 + 记录位置，与朗读节奏同步；整页播完则提前结束等待
                 for i in range(start_idx, len(sentences)):
                     if self._tts_stop_event.is_set():
                         break
@@ -739,15 +780,23 @@ class BookViewer(ft.Container):
                 except Exception as ex:
                     print(f"[BookViewer] 朗读任务异常: {ex}")
 
-                # 播放结束，清理本页预取临时文件（若使用了预取）
-                if prefetched and os.path.exists(prefetched):
+                # 等待下一段并行合成完成（通常播放期间已完成），并切换到该缓冲
+                if pending is not None:
                     try:
-                        os.unlink(prefetched)
-                    except Exception:
-                        pass
+                        res = await pending
+                        if res is None:
+                            print("[BookViewer] 下一段合成失败")
+                        else:
+                            last_synth_idx = free_idx
+                    except Exception as ex:
+                        print(f"[BookViewer] 并行合成异常: {ex}")
+                    pending = None
 
                 if self._tts_stop_event.is_set():
                     break
+
+                # 标记首段已结束（此后一律走重载路径）
+                first_seg = False
 
                 # 自动翻页
                 if self.current < len(self.pages) - 1:
@@ -765,15 +814,21 @@ class BookViewer(ft.Container):
                 traceback.print_exc()
                 break
 
-        # 清理未使用的预取任务及其临时文件
-        for t in prefetch_tasks.values():
-            try:
-                if t.done():
-                    p = t.result()
+        # 清理：取消未完成的并行合成 + 删除 ping-pong 双缓冲文件
+        if pending is not None:
+            if not pending.done():
+                pending.cancel()
+            else:
+                try:
+                    p = pending.result()
                     if p and os.path.exists(p):
                         os.unlink(p)
-                else:
-                    t.cancel()
+                except Exception:
+                    pass
+        for bp in buf_paths:
+            try:
+                if os.path.exists(bp):
+                    os.unlink(bp)
             except Exception:
                 pass
 
@@ -801,6 +856,22 @@ class BookViewer(ft.Container):
         print(f"[BookViewer] TTS朗读: {len(text)} 字符")
         try:
             await self.tts.speak(text, self._tts_stop_event, prefetched_path=prefetched_path)
+        except Exception as ex:
+            print(f"[BookViewer] TTS错误: {ex}")
+            import traceback
+            traceback.print_exc()
+
+    async def _speak_text_from_file(self, text: str, mp3_path, is_first: bool):
+        """用跨平台 TTS 播放已合成好的 mp3 文件（ping-pong 方案核心）。
+
+        is_first=True 走"创建 Audio + 加载"的**首段方法**（经实测可靠出声）；
+        is_first=False 复用已有 Audio 对象、重载新 base64 内容（第 2 段起）。"""
+        if not text.strip():
+            return
+
+        print(f"[BookViewer] TTS朗读(段): {len(text)} 字符, is_first={is_first}")
+        try:
+            await self.tts.speak_file(mp3_path, self._tts_stop_event, is_first=is_first)
         except Exception as ex:
             print(f"[BookViewer] TTS错误: {ex}")
             import traceback

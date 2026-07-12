@@ -281,7 +281,7 @@ class TTSEngine:
             # 清理回调，避免重复触发
             audio.on_loaded = None
 
-    async def _play_flet_audio(self, mp3_path: str, duration: float, stop_event):
+    async def _play_flet_audio(self, mp3_path: str, duration: float, stop_event, is_first: bool = False):
         """用 flet_audio 播放本地 mp3 文件，等待播放结束（或停止信号）。
 
         v1.0.40 关键修复：把 mp3 bytes 转为 base64 字符串作为 src。
@@ -308,7 +308,7 @@ class TTSEngine:
             print(f"[TTS] 读取 mp3 文件失败: {ex}")
             raise
 
-        is_first_play = (self._audio is None)
+        is_first_play = is_first if is_first is not None else (self._audio is None)
 
         # 创建 on_loaded future（必须在创建/更新 audio 之前设置回调）
         # 原因：register_service 可能把 audio 立即发送到原生侧，dart 端 init() → _applySource()
@@ -390,9 +390,24 @@ class TTSEngine:
             await asyncio.wait_for(loaded_future, timeout=5.0)
             print("[TTS] 音频已加载（on_loaded 触发）")
         except asyncio.TimeoutError:
-            print("[TTS] 警告：等待音频加载超时(5s)，仍尝试播放")
-            print("[TTS] 可能原因：1) mp3 base64 损坏；2) 原生 audioplayers setSourceBytes 失败；3) dart 端 _applySource 异常")
-            await asyncio.sleep(0.3)  # 兜底等待
+            if not is_first_play:
+                # 非首段重载偶发丢失 update：重试一次，强制 dart 端重新 setSourceBytes
+                print("[TTS] 非首段首次等待加载超时，重试 update 一次")
+                try:
+                    audio.src = mp3_b64
+                    audio.update()
+                except Exception as ex:
+                    print(f"[TTS] 重试 update 异常: {ex}")
+                try:
+                    await asyncio.wait_for(loaded_future, timeout=3.0)
+                    print("[TTS] 重试后音频已加载（on_loaded 触发）")
+                except asyncio.TimeoutError:
+                    print("[TTS] 警告：重试后仍超时，仍尝试播放")
+                    await asyncio.sleep(0.3)
+            else:
+                print("[TTS] 警告：等待音频加载超时(5s)，仍尝试播放")
+                print("[TTS] 可能原因：1) mp3 base64 损坏；2) 原生 audioplayers setSourceBytes 失败；3) dart 端 _applySource 异常")
+                await asyncio.sleep(0.3)  # 兜底等待
         finally:
             # 清理 on_loaded 回调，避免重复触发
             try:
@@ -472,6 +487,70 @@ class TTSEngine:
                 pass
             return None
         return mp3_path
+
+    async def synthesize_to_path_named(self, text: str, path: str) -> Optional[str]:
+        """合成 text 并写入指定 path（覆盖写），返回 path；失败返回 None。
+        用于 ping-pong 双缓冲方案（固定文件名 tmpbookreader1/2.mp3）。"""
+        text = (text or "").strip()
+        if not text:
+            return None
+        # 优先 Edge TTS
+        if _edge_lite_synthesize is not None:
+            try:
+                mp3 = await _edge_lite_synthesize(
+                    text, self._voice_id(text), _rate_string(self.speed)
+                )
+                if mp3:
+                    try:
+                        with open(path, "wb") as f:
+                            f.write(mp3)
+                        return path
+                    except Exception as ex:
+                        print(f"[TTS] 写入指定路径失败: {ex}")
+                        return None
+            except Exception as ex:
+                print(f"[TTS] Edge 合成失败，回退 gTTS: {ex}")
+        # 回退 gTTS（写到指定路径）
+        if _GTTS is not None:
+            try:
+                lang = "zh-cn" if _CJK_RE.search(text) else "en"
+                await asyncio.to_thread(_GTTS(text=text, lang=lang, tld="com").save, path)
+                if os.path.exists(path):
+                    return path
+            except Exception as ex:
+                print(f"[TTS] gTTS 写入指定路径失败: {ex}")
+        return None
+
+    async def speak_file(self, mp3_path: str, stop_event, is_first: Optional[bool] = None,
+                        duration: Optional[float] = None) -> float:
+        """直接播放已合成好的 mp3 文件（ping-pong 方案的核心入口）。
+
+        is_first=True  →  走"首次创建 Audio 并加载"的**首段方法**（经实测可靠出声）；
+        is_first=False →  复用已有 Audio 对象、重载新 base64 内容（第 2 段起）；
+        is_first=None  →  自动判断（无 Audio 即视为首段）。
+
+        桌面端：直接用 pygame 播放该文件（不经过 flet_audio）。"""
+        if mp3_path is None or not os.path.exists(mp3_path):
+            print(f"[TTS] speak_file 收到无效 mp3 路径: {mp3_path}")
+            return 0.0
+        if not self._is_mobile():
+            d = duration if duration is not None else _estimate_duration("")
+            await self._play_pygame(mp3_path, stop_event, d)
+            return d
+        d = duration if duration is not None else _estimate_duration("")
+        if is_first is None:
+            is_first = (self._audio is None)
+        async with self._play_lock:
+            try:
+                await self._play_flet_audio(mp3_path, d, stop_event, is_first=is_first)
+            except Exception as ex:
+                print(f"[TTS] flet_audio 播放失败，回退系统播放器(file://): {ex}")
+                try:
+                    self._play_via_file_uri(mp3_path)
+                    await self._wait(d, stop_event)
+                finally:
+                    self._shutdown_server()
+        return d
 
     # ==================================================================
     # 桌面端：Edge TTS 合成 + pygame 应用内播放
