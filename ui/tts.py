@@ -97,8 +97,7 @@ class TTSEngine:
         self.speed = 1.2        # 朗读倍速（1.0~2.0）
         self.voice = "male"     # 音色：male / female（缺省男）
         self._stop_event = None
-        self._audio = None  # flet_audio.Audio 控件（安卓端应用内播放，懒创建）
-        self._audio_just_registered = False  # 首次注册后给原生侧一点准备时间
+        self._audio = None  # flet_audio.Audio 控件（安卓端应用内播放，v1.0.37：每次播放重建）
         self._play_lock = asyncio.Lock()  # 防止并发播放同一 audio 控件
         try:
             print(f"[TTS] 初始化：平台={'mobile' if self._is_mobile() else 'desktop'}，"
@@ -180,9 +179,17 @@ class TTSEngine:
         except Exception:
             pass
 
-    def _get_flet_audio(self, initial_src=None, on_loaded=None, on_state_change=None):
-        """懒创建并注册一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。
-        返回 audio。首次创建后需给原生控件一点注册时间再播放。
+    def _create_new_audio(self, mp3_bytes: bytes, on_loaded=None, on_state_change=None):
+        """创建并注册一个新的 flet_audio.Audio 控件（v1.0.37）。
+
+        每次播放都创建新 Audio，避免 audioplayers Android 端 setSourceBytes
+        在已有 source 时不重新加载的问题（v1.0.36 的 bug：后续播放无声）。
+
+        关键技术点（继承自 v1.0.34-1.0.36 的经验）：
+        - src 必须在创建时传入非空（dart 端 init() 检查）
+        - src 用 bytes 模式（Android setSourceDeviceFile 会失败）
+        - on_loaded 回调必须在创建时传入（避免错过 dart 端 init 事件）
+        - 必须手动调用 page._services.register_service() 注册
 
         关键坑 1（Flet 0.85.3 Service 注册）：Audio 是 Service 子类，其 init() 会调用
         context.page._services.register_service(self) 来注册到原生侧。但 init() 在
@@ -203,83 +210,96 @@ class TTSEngine:
         - 原始字节数据（bytes）
         dart 端 _applySource() 对路径会调用 setSourceDeviceFile(path)，对 bytes 会调用
         setSourceBytes(bytes)。
-        
+
         **Android 上 setSourceDeviceFile 会抛 PlatformException**：
         "Failed to set source. MEDIA_ERROR_UNKNOWN {what:1}, MEDIA_ERROR_SYSTEM"
         原因可能是 Android 11+ scoped storage 限制、MediaPlayer 路径解析 bug、或
         app cache 目录权限问题。具体根因不明，但用 bytes 模式可以完全绕过这些问题。
-        
-        修复（v1.0.36）：创建 Audio 时直接传 mp3 文件的 bytes 作为 src，dart 端会用
-        setSourceBytes 加载，完全绕过文件系统。后续播放也用 bytes 模式。
 
-        关键坑 4（on_loaded 事件可能在设置回调之前触发）：
+        修复（v1.0.36）：创建 Audio 时直接传 mp3 文件的 bytes 作为 src，dart 端会用
+        setSourceBytes 加载，完全绕过文件系统。
+
+        关键坑 4（v1.0.37：复用 Audio 更新 src=bytes 不触发 on_loaded）：
+        v1.0.36 bytes 模式首次播放成功，但第二次播放更新 audio.src = new_bytes 后，
+        dart 端 _applySource() 不触发 on_loaded 事件 → 5秒超时 + 30秒 TimeoutException。
+        根本原因：audioplayers Android 端 setSourceBytes 在已有 source 时不会重新加载，
+        或 flet_audio dart 端 _applySource 在 src 类型相同时跳过重新加载。
+        修复（v1.0.37）：每次播放都创建新 Audio 对象，旧的 release 后由
+        ServiceRegistry.uninstall_services() 自动清理（基于 refcount）。
+
+        关键坑 5（on_loaded 事件可能在设置回调之前触发）：
         register_service 可能把 audio 控件立即发送到原生侧，dart 端 init() → _applySource()
         可能在 Python 端设置 on_loaded 回调之前就完成。所以 on_loaded 回调必须在创建 Audio
         时就传入（通过 Audio.__init__ 的 on_loaded 参数），不能在创建后再设置。"""
-        if self._audio is None:
-            if initial_src is None:
-                raise ValueError("首次创建 Audio 必须传入 initial_src（mp3 bytes 或路径）")
-            # 创建 Audio 时直接用 mp3 bytes（不能用路径！Android 上 setSourceDeviceFile 会失败）
-            # on_loaded 回调必须在创建时就传入，避免错过 dart 端 init() 触发的事件
-            kwargs = dict(
-                src=initial_src,
-                volume=1.0,
-                autoplay=False,
-                release_mode=_FTA.ReleaseMode.STOP,
-            )
-            if on_loaded is not None:
-                kwargs["on_loaded"] = on_loaded
-            if on_state_change is not None:
-                kwargs["on_state_change"] = on_state_change
-            self._audio = _FTA.Audio(**kwargs)
-            try:
-                # 正确注册方式：通过 page._services.register_service()
-                # ServiceRegistry 会把 _services 列表（含 audio）序列化发送到原生侧
-                self.page._services.register_service(self._audio)
-                self._audio_just_registered = True
-                # 诊断：确认 service 真的注册到 registry 里（注意是 _services._services）
-                try:
-                    n = len(self.page._services._services)
-                    print(f"[TTS] flet_audio service 已注册 (registry size={n})")
-                except Exception as diag_ex:
-                    print(f"[TTS] flet_audio service 已注册 (无法读取 registry size: {diag_ex})")
-                # 诊断：确认 audio 控件的 page 引用和 control ID
-                try:
-                    print(f"[TTS] audio.page={self._audio.page is not None}, audio._i={getattr(self._audio, '_i', '?')}")
-                except Exception:
-                    pass
-            except Exception as ex:
-                print(f"[TTS] 注册 flet_audio service 失败: {ex}")
-                print("[TTS] 可能原因：pyproject.toml 缺少 [tool.flet.flutter.dependencies] flet_audio 声明")
-                self._audio_just_registered = False
-        return self._audio
-
-    async def _wait_for_audio_loaded(self, audio, timeout: float = 5.0) -> bool:
-        """等待 audio 控件的 on_loaded 事件触发（原生侧 _applySource 完成）。
-        返回 True 表示已加载，False 表示超时。"""
-        loop = asyncio.get_event_loop()
-        loaded_future = loop.create_future()
-
-        def _on_loaded(e):
-            if not loaded_future.done():
-                loaded_future.set_result(True)
-
-        audio.on_loaded = _on_loaded
+        # 创建 Audio 时直接用 mp3 bytes（不能用路径！Android 上 setSourceDeviceFile 会失败）
+        # on_loaded 回调必须在创建时就传入，避免错过 dart 端 init() 触发的事件
+        kwargs = dict(
+            src=mp3_bytes,
+            volume=1.0,
+            autoplay=False,
+            release_mode=_FTA.ReleaseMode.STOP,
+        )
+        if on_loaded is not None:
+            kwargs["on_loaded"] = on_loaded
+        if on_state_change is not None:
+            kwargs["on_state_change"] = on_state_change
+        audio = _FTA.Audio(**kwargs)
+        self._audio = audio  # 保存强引用，stop() 时可暂停；下次播放前会 release 并清空
         try:
-            await asyncio.wait_for(loaded_future, timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
-        finally:
-            # 清理回调，避免重复触发
-            audio.on_loaded = None
+            # 正确注册方式：通过 page._services.register_service()
+            # ServiceRegistry 会把 _services 列表（含 audio）序列化发送到原生侧
+            self.page._services.register_service(audio)
+            # 诊断：确认 service 真的注册到 registry 里（注意是 _services._services）
+            try:
+                n = len(self.page._services._services)
+                print(f"[TTS] flet_audio service 已注册 (registry size={n})")
+            except Exception as diag_ex:
+                print(f"[TTS] flet_audio service 已注册 (无法读取 registry size: {diag_ex})")
+            # 诊断：确认 audio 控件的 page 引用和 control ID
+            try:
+                print(f"[TTS] audio.page={audio.page is not None}, audio._i={getattr(audio, '_i', '?')}")
+            except Exception:
+                pass
+        except Exception as ex:
+            print(f"[TTS] 注册 flet_audio service 失败: {ex}")
+            print("[TTS] 可能原因：pyproject.toml 缺少 [tool.flet.flutter.dependencies] flet_audio 声明")
+        return audio
+
+    async def _release_old_audio(self):
+        """释放旧 Audio 对象并从 ServiceRegistry 清理（v1.0.37）。
+
+        每次播放前调用，确保每次播放都从干净状态开始。
+        利用 Flet ServiceRegistry.uninstall_services() 自动清理 refcount 低的 service：
+        当 self._audio = None 后，旧 Audio 失去强引用，refcount 降到阈值以下，
+        uninstall_services() 会从 _services 列表中移除它并通知原生侧释放资源。
+        """
+        if self._audio is None:
+            return
+        old = self._audio
+        self._audio = None  # 先清空强引用，让 refcount 降下来
+        try:
+            await old.pause()
+        except Exception:
+            pass
+        try:
+            await old.release()
+        except Exception:
+            pass
+        # 清理 registry 中不再被强引用的 service（Flet ServiceRegistry.uninstall_services）
+        try:
+            self.page._services.unregister_services()
+        except Exception as ex:
+            print(f"[TTS] 清理旧 audio service 失败(非致命): {ex}")
 
     async def _play_flet_audio(self, mp3_path: str, duration: float, stop_event):
         """用 flet_audio 播放本地 mp3 文件，等待播放结束（或停止信号）。
 
-        v1.0.36 关键修复：用 bytes 模式而不是路径模式。
-        读取 mp3 文件为 bytes，传给 audio.src，dart 端会用 setSourceBytes 加载，
-        完全绕过 Android 文件系统权限/路径问题。
+        v1.0.37 关键修复：每次播放都创建新 Audio 对象。
+        v1.0.36 用 bytes 模式成功让首次播放出声，但后续更新 src=bytes 不触发 on_loaded 事件，
+        导致从第二段开始无声（5秒超时 + 30秒 TimeoutException）。
+        根本原因：audioplayers Android 端 setSourceBytes 在已有 source 时不会重新加载。
+        修复：每次播放前释放旧 Audio 并从 registry 清理，创建新 Audio，
+        确保每次都从干净状态开始。
         """
         try:
             size = os.path.getsize(mp3_path) if os.path.exists(mp3_path) else -1
@@ -296,9 +316,11 @@ class TTSEngine:
             print(f"[TTS] 读取 mp3 文件失败: {ex}")
             raise
 
-        is_first_play = (self._audio is None)
+        # v1.0.37 关键修复：每次播放都创建新 Audio 对象
+        # 释放旧 Audio（如果有），避免资源泄漏和 registry 膨胀
+        await self._release_old_audio()
 
-        # 创建 on_loaded future（必须在创建/更新 audio 之前设置回调）
+        # 创建 on_loaded future（必须在创建 Audio 之前定义回调）
         # 原因：register_service 可能把 audio 立即发送到原生侧，dart 端 init() → _applySource()
         # 可能在 Python 端设置 on_loaded 回调之前就完成，导致事件丢失。
         loop = asyncio.get_event_loop()
@@ -319,43 +341,18 @@ class TTSEngine:
             state_log.append(state)
             print(f"[TTS] audio on_state_change: {state}")
 
-        if is_first_play:
-            # 第一次创建：直接用 mp3 bytes 作为 initial_src，并在创建时设置 on_loaded 回调
-            # dart 端 init() → update() → _applySource() → setSourceBytes(mp3_bytes)
-            # 加载成功后触发 on_loaded 事件，audio_player 进入 ready 状态
-            audio = self._get_flet_audio(
-                initial_src=mp3_bytes,  # ← bytes 模式，不是路径！
-                on_loaded=_on_loaded,
-                on_state_change=_on_state_change,
-            )
-            just_registered = getattr(self, "_audio_just_registered", False)
-            if just_registered:
-                # 原生 Audio service 首次注册需要一点时间，否则首句可能无声
-                await asyncio.sleep(0.5)
-                self._audio_just_registered = False
-            print(f"[TTS] 首次播放，audio.src 已在创建时设置（bytes 模式，{len(mp3_bytes)} bytes）")
-            # 第一次创建时 src 已经是 mp3_bytes，但还需要 audio.update() 触发 dart 端 update()
-            # （register_service 可能已经发送，但 on_state_change 等属性可能需要 update 同步）
-            try:
-                audio.update()
-            except Exception as ex:
-                print(f"[TTS] audio.update() 异常: {ex}")
-        else:
-            audio = self._get_flet_audio()
-            # 设置回调
-            try:
-                audio.on_loaded = _on_loaded
-                audio.on_state_change = _on_state_change
-            except Exception:
-                pass
-            # 后续播放，更新 src 为新的 bytes（v1.0.36：bytes 模式）
-            # dart 端 update() 检测到 bytes 变化 → _applySource() → setSourceBytes() → on_loaded
-            audio.src = mp3_bytes
-            print(f"[TTS] audio.src 已设置（bytes 模式，{len(mp3_bytes)} bytes）")
-            try:
-                audio.update()
-            except Exception as ex:
-                print(f"[TTS] audio.update() 异常: {ex}")
+        # 每次都创建新 Audio（v1.0.37 关键修复）
+        # dart 端 init() → update() → _applySource() → setSourceBytes(mp3_bytes)
+        # 加载成功后触发 on_loaded 事件，audio_player 进入 ready 状态
+        audio = self._create_new_audio(
+            mp3_bytes=mp3_bytes,  # ← bytes 模式，不是路径！
+            on_loaded=_on_loaded,
+            on_state_change=_on_state_change,
+        )
+        print(f"[TTS] 新 Audio 已创建（bytes 模式，{len(mp3_bytes)} bytes）")
+
+        # 原生 Audio service 注册后需要一点时间，否则 play() 可能失败
+        await asyncio.sleep(0.5)
 
         # 等待 on_loaded 事件（原生 _applySource 完成后触发），最多等 5 秒
         try:
@@ -402,10 +399,8 @@ class TTSEngine:
             await audio.pause()
         except Exception:
             pass
-        try:
-            await audio.release()
-        except Exception:
-            pass
+        # 注意：不在这里 release audio，下次播放时 _release_old_audio 会处理
+        # 这样如果连续播放同一句（如重试），可以复用 audio
         # 清理状态监听
         try:
             audio.on_state_change = None
