@@ -764,6 +764,15 @@ class TTSEngine:
             return
 
         # ---- 移动端：单 Audio + COMPLETED 事件链 ----
+        # 跨会话清理（修复"停止后再启动没声音"）：
+        # 上一会话的 Audio 在 stop() 时只被 pause()+release()，
+        # 但仍留在 Flet service registry 中（self._audio 还指着它）。
+        # 本会话若再新建一个 Audio，registry 里就会有两个 AudioPlayer，
+        # Android 上两个 player 抢 MediaPlayer 资源 → 新控件 setSourceBytes
+        # 抛异常 → on_loaded 永不触发 → 静音（即 v1.0.43 的"第二个 player 静音"）。
+        # 修复：启动新会话前，先把残留的旧 Audio 从 registry 真正移除并 dispose，
+        # 保证任意时刻只有一个 Audio 控件被注册。
+        await self._dispose_flet_audio()
         loop = asyncio.get_event_loop()
         loaded_future = loop.create_future()
         completed_holder = [loop.create_future()]  # 当前段播完置位
