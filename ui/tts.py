@@ -219,11 +219,19 @@ class TTSEngine:
         return audio
 
     async def _dispose_flet_audio(self):
-        """销毁上一段的 Audio 控件，避免 ServiceRegistry / dart 侧 AudioPlayer 无限累积。
+        """销毁上一段的 Audio 控件，并【真正释放】底层原生 AudioPlayer。
 
-        步骤：pause + release 释放原生 player 资源 → 解除 self._audio 引用 →
-        尽力从 registry 移除（引用计数清理）。即使未移除，release() 已释放原生资源，
-        单次阅读会话（≤ 数十段）累积可接受。"""
+        v1.0.42 及之前：只 pause()+release()+unregister_services()，但
+        ServiceRegistry.unregister_services() 靠引用计数移除，registry 列表自身持有
+        对旧 audio 的引用 → refcount 永远降不到阈值 → 旧 AudioService 永远不被移除、
+        其 AudioPlayer 永远不被 dispose()。第 2 段的"新" AudioPlayer 与原生层残留的
+        旧 player 抢 MediaPlayer 资源（audioplayers 在 Android 上对第二个 player 与残留
+        player 冲突）→ setSourceBytes 抛异常 → loaded 事件不触发 → 静音。
+
+        修复（v1.0.43）：除 release() 外，直接把旧 audio 从 registry._services 列表移除，
+        再调 unregister_services() 兜底，强制 refcount 下降 → Flet 下发"移除控件" →
+        dart 侧 AudioService.dispose() → player.dispose() 真正释放原生资源。这样下一段
+        拿到的 AudioPlayer 是干净的全新实例，setSourceBytes 才能成功。"""
         a = self._audio
         if a is None:
             return
@@ -237,9 +245,25 @@ class TTSEngine:
             pass
         self._audio = None
         try:
-            self.page._services.unregister_services()
-        except Exception:
-            pass
+            reg = self.page._services
+            svcs = getattr(reg, "_services", None)
+            if svcs is not None and a in svcs:
+                svcs.remove(a)
+                try:
+                    reg.update()  # 触发 diff → dart 侧 dispose 旧 AudioService → player.dispose()
+                except Exception:
+                    pass
+            try:
+                reg.unregister_services()  # 兜底（此时 refcount 已因移除而下降）
+            except Exception:
+                pass
+            try:
+                n = len(getattr(reg, "_services", []))
+                print(f"[TTS] 已 dispose 旧 Audio：registry size={n}")
+            except Exception:
+                pass
+        except Exception as ex:
+            print(f"[TTS] dispose 移除 registry 失败(非致命): {ex}")
 
     def _get_flet_audio(self, initial_src=None, on_loaded=None, on_state_change=None):
         """懒创建并注册一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。
@@ -370,6 +394,9 @@ class TTSEngine:
         # v1.0.42：每段都销毁上一段的旧 Audio，再新建一个独立控件。
         # 复用控件重载在真机失效（Flet 对超大 base64 字符串 diff 不触发 dart 重载）。
         await self._dispose_flet_audio()
+        # 等 dart 侧把旧 AudioService/AudioPlayer 真正 dispose() 完（异步），
+        # 否则下一段的新 player 可能与残留的旧 player 在原生层短暂冲突。
+        await asyncio.sleep(0.3)
 
         # 创建 on_loaded future（必须在创建/更新 audio 之前设置回调）
         # 原因：register_service 可能把 audio 立即发送到原生侧，dart 端 init() → _applySource()
