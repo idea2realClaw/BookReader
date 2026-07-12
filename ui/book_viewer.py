@@ -560,12 +560,8 @@ class BookViewer(ft.Container):
         if not self._is_reading or self._read_task is None:
             return
         start = self._current_sentence_idx if self._current_sentence_idx >= 0 else 0
-        # 停止原播放
-        self._tts_stop_event.set()
-        try:
-            await self._read_task
-        except Exception:
-            pass
+        # 取消原播放（cancel 比等 stop_event 更可靠，避免旧任务残留）
+        await self._cancel_read_task()
         # 以新参数从当前句重启
         self._tts_stop_event.clear()
         self._is_reading = True
@@ -584,13 +580,9 @@ class BookViewer(ft.Container):
     async def _start_reading_from(self, idx: int):
         """停止当前朗读（若有），并从指定句子开始朗读。"""
         if self._is_reading:
-            # 先结束旧任务，避免两个朗读循环重叠
             self._tts_stop_event.set()
-            if self._read_task is not None:
-                try:
-                    await self._read_task
-                except Exception:
-                    pass
+        # 不论是否正在朗读，先彻底取消旧任务，避免两个朗读循环重叠
+        await self._cancel_read_task()
         # 进入朗读状态，从该句开始
         self._tts_stop_event.clear()
         self._is_reading = True
@@ -598,6 +590,30 @@ class BookViewer(ft.Container):
         self.read_btn.tooltip = "停止朗读"
         self.ft_page.update()
         self._read_task = asyncio.create_task(self._read_all(start_sentence=idx))
+
+    async def _cancel_read_task(self, timeout: float = 2.0):
+        """彻底取消并等待旧的朗读协程结束，保证任意时刻只有一个朗读任务。
+
+        根因（v1.1.2 修复）：停止→再启动时旧 _read_task 并未被取消，
+        它仍在后台用旧 Audio 控件继续播放；新会话 _tts_stop_event.clear()
+        又把它"复活"，导致两个 play_sequential 并发、抢同一个 Audio 控件与
+        Flet invoke —— 新会话首段 on_loaded 永不触发、play() 超时无声音。
+        因此每次启动新朗读前，必须先 cancel 旧任务并等其真正退出。"""
+        task = self._read_task
+        if task is None or task.done():
+            self._read_task = None
+            return
+        task.cancel()
+        try:
+            # shield 保护旧任务本身不被外层 wait_for 的超时取消二次打断；
+            # 这里只是等它因 CancelledError 正常退出
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            # 旧任务已被取消，或卡在不可中断的 invoke（如 play() 10s 超时），
+            # 后者让它自己在后台死，不阻塞新会话启动
+            pass
+        finally:
+            self._read_task = None
 
     async def _toggle_read(self, e):
         """切换朗读状态。
@@ -613,17 +629,16 @@ class BookViewer(ft.Container):
             if self._restart_timer is not None:
                 self._restart_timer.cancel()
                 self._restart_timer = None
-            try:
-                self.tts.stop()
-            except Exception:
-                pass
-            self.read_btn.icon = ft.Icons.PLAY_ARROW
-            self.read_btn.tooltip = "朗读全书（点击句子可从该句开始）"
-            await self._clear_highlight()
-            self.ft_page.update()
+            # 先彻底取消旧朗读协程，避免停止后仍残留后台任务
+            await self._cancel_read_task()
+            # 复用收尾逻辑：清高亮 / 停播放 / 复位按钮
+            await self._finalize_reading()
             print(f"[BookViewer] 停止朗读")
         else:
-            # 开始朗读：优先从已恢复/已点击的句开始（否则当前页第一句）
+            # 开始朗读：先确保没有残留的朗读协程（停止→再启动必须干净），
+            # 否则旧任务会被新会话 clear 的 stop_event"复活"而并发抢 Audio。
+            await self._cancel_read_task()
+            # 优先从已恢复/已点击的句开始（否则当前页第一句）
             start = self._current_sentence_idx if self._current_sentence_idx >= 0 else 0
             self._tts_stop_event.clear()
             self._is_reading = True
@@ -889,7 +904,7 @@ class BookViewer(ft.Container):
 
         if not all_sent:
             print("[BookViewer] 无可读句子，停止顺序朗读")
-            self._finalize_reading()
+            await self._finalize_reading()
             return
 
         texts = [s for s, _ in all_sent]
@@ -916,7 +931,7 @@ class BookViewer(ft.Container):
         await self.tts.play_sequential(
             texts, self._tts_stop_event, on_seg_start=on_seg_start
         )
-        self._finalize_reading()
+        await self._finalize_reading()
         print("[BookViewer] 顺序朗读结束")
 
     # ==================================================================
@@ -968,7 +983,7 @@ class BookViewer(ft.Container):
 
         if not all_sent:
             print("[BookViewer] 无可读句子，停止连续朗读")
-            self._finalize_reading()
+            await self._finalize_reading()
             return
 
         # 2) 拼成单个 mp3（流式写入，避免整本字节驻留内存）
@@ -1012,7 +1027,7 @@ class BookViewer(ft.Container):
                 os.unlink(full_path)
         except Exception:
             pass
-        self._finalize_reading()
+        await self._finalize_reading()
         print("[BookViewer] 连续朗读结束")
 
     async def _finalize_reading(self):
