@@ -21,6 +21,7 @@
 """
 
 import asyncio
+import base64
 import os
 import re
 import subprocess
@@ -171,10 +172,9 @@ class TTSEngine:
             pass
 
     async def _stop_flet_audio_async(self, a):
-        # v1.0.39：停止朗读时调用 stop() 而不是 pause()，把 player 状态重置，
-        # 下次从干净状态开始，避免继续播放旧音频。
+        # v1.0.40：Audio 对象没有 stop() 方法，用 pause() + release() 停止并重置 player。
         try:
-            await a.stop()
+            await a.pause()
         except Exception:
             pass
         try:
@@ -198,7 +198,7 @@ class TTSEngine:
         → 后续 audio.update() / play() 都不会被执行 → 30秒超时。
         修复：创建 Audio 时必须传非空 src。
 
-        关键坑 3（v1.0.36：必须用 bytes 模式，不能用路径模式）：
+        关键坑 3（v1.0.36-1.0.39：原始 bytes 更新不可靠）：
         flet_audio.Audio.src 类型是 Optional[Union[str, bytes]]，支持三种格式：
         - URL 或本地 asset 文件路径（str）
         - base64 字符串
@@ -211,8 +211,13 @@ class TTSEngine:
         原因可能是 Android 11+ scoped storage 限制、MediaPlayer 路径解析 bug、或
         app cache 目录权限问题。具体根因不明，但用 bytes 模式可以完全绕过这些问题。
         
-        修复（v1.0.36）：创建 Audio 时直接传 mp3 文件的 bytes 作为 src，dart 端会用
-        setSourceBytes 加载，完全绕过文件系统。后续播放也用 bytes 模式。
+        **v1.0.39 日志发现：Audio 对象没有 stop() 方法**，所以 v1.0.39 的 stop() 调用全部
+        无效。同时发现复用 Audio 对象更新 audio.src = new_bytes 后 dart 端不再触发 on_loaded，
+        推断是 Flet 的 Prop 变更检测对 bytes 不可靠（或 update 补丁未实际发送新 src）。
+        
+        修复（v1.0.40）：把 mp3 bytes 先转为 base64 字符串，再用字符串作为 src。Flet 对
+        字符串的变更检测可靠，dart 端 getSrc() 会把 base64 字符串解码回 bytes 并调用
+        setSourceBytes。每段 base64 内容不同，保证 src 变更被识别，player 会重新加载。
 
         关键坑 4（on_loaded 事件可能在设置回调之前触发）：
         register_service 可能把 audio 控件立即发送到原生侧，dart 端 init() → _applySource()
@@ -220,8 +225,8 @@ class TTSEngine:
         时就传入（通过 Audio.__init__ 的 on_loaded 参数），不能在创建后再设置。"""
         if self._audio is None:
             if initial_src is None:
-                raise ValueError("首次创建 Audio 必须传入 initial_src（mp3 bytes 或路径）")
-            # 创建 Audio 时直接用 mp3 bytes（不能用路径！Android 上 setSourceDeviceFile 会失败）
+                raise ValueError("首次创建 Audio 必须传入 initial_src（mp3 base64 字符串）")
+            # 创建 Audio 时直接用 mp3 base64 字符串（dart 端解码为 bytes 后 setSourceBytes）
             # on_loaded 回调必须在创建时就传入，避免错过 dart 端 init() 触发的事件
             kwargs = dict(
                 src=initial_src,
@@ -279,12 +284,11 @@ class TTSEngine:
     async def _play_flet_audio(self, mp3_path: str, duration: float, stop_event):
         """用 flet_audio 播放本地 mp3 文件，等待播放结束（或停止信号）。
 
-        v1.0.38：回退到 v1.0.36 的单 Audio 复用策略，并修复后续段无声。
-        v1.0.36 状态：首段播放正常，第二段起更新 audio.src = new_bytes 后 dart 端
-        不再触发 on_loaded，play() 30秒超时。
-        v1.0.38 假设：每段结束时调用 audio.release() 会释放原生 MediaPlayer，导致下一段
-        update() 里的 setSourceBytes(newBytes) 在已释放/异常的 player 上失败。改为只 pause()，
-        保持 player 可用，供下一段 setSourceBytes 重新加载新 source。
+        v1.0.40 关键修复：把 mp3 bytes 转为 base64 字符串作为 src。
+        原因：v1.0.36-1.0.39 用原始 bytes 作为 src，复用 Audio 对象时更新 src 不触发
+        dart 端 on_loaded 事件，导致后续段一直播放旧音频。Flet 对字符串的变更检测
+        更可靠，base64 字符串内容不同，update() 补丁一定会把新 src 发送到 dart 端，
+        dart 端解码为 bytes 后调用 setSourceBytes，触发 on_loaded 并播放新音频。
         """
         try:
             size = os.path.getsize(mp3_path) if os.path.exists(mp3_path) else -1
@@ -292,11 +296,14 @@ class TTSEngine:
             size = -1
         print(f"[TTS] flet_audio 播放: {mp3_path} (size={size})")
 
-        # 读取 mp3 文件为 bytes（v1.0.36 关键修复：用 bytes 模式绕过文件系统问题）
+        # 读取 mp3 文件为 bytes，然后转为 base64 字符串（v1.0.40：用字符串触发可靠变更检测）
         try:
             with open(mp3_path, 'rb') as f:
                 mp3_bytes = f.read()
-            print(f"[TTS] 读取 mp3 bytes: {len(mp3_bytes)} bytes")
+            mp3_b64 = base64.b64encode(mp3_bytes).decode('ascii')
+            print(f"[TTS] 读取 mp3 bytes: {len(mp3_bytes)} bytes, base64 长度: {len(mp3_b64)}")
+            # 诊断：打印前 16 字节 hash，确认不同段内容不同
+            print(f"[TTS] mp3 前 16 字节 hash: {hash(mp3_bytes[:16])}")
         except Exception as ex:
             print(f"[TTS] 读取 mp3 文件失败: {ex}")
             raise
@@ -325,11 +332,11 @@ class TTSEngine:
             print(f"[TTS] audio on_state_change: {state}")
 
         if is_first_play:
-            # 第一次创建：直接用 mp3 bytes 作为 initial_src，并在创建时设置 on_loaded 回调
-            # dart 端 init() → update() → _applySource() → setSourceBytes(mp3_bytes)
+            # 第一次创建：直接用 mp3 base64 字符串作为 initial_src，并在创建时设置 on_loaded 回调
+            # dart 端 init() → update() → _applySource() → setSourceBytes(decoded bytes)
             # 加载成功后触发 on_loaded 事件，audio_player 进入 ready 状态
             audio = self._get_flet_audio(
-                initial_src=mp3_bytes,  # ← bytes 模式，不是路径！
+                initial_src=mp3_b64,  # ← base64 字符串模式，dart 端解码为 bytes
                 on_loaded=_on_loaded,
                 on_state_change=_on_state_change,
             )
@@ -338,8 +345,8 @@ class TTSEngine:
                 # 原生 Audio service 首次注册需要一点时间，否则首句可能无声
                 await asyncio.sleep(0.5)
                 self._audio_just_registered = False
-            print(f"[TTS] 首次播放，audio.src 已在创建时设置（bytes 模式，{len(mp3_bytes)} bytes）")
-            # 第一次创建时 src 已经是 mp3_bytes，但还需要 audio.update() 触发 dart 端 update()
+            print(f"[TTS] 首次播放，audio.src 已在创建时设置（base64 字符串模式，{len(mp3_b64)} 字符）")
+            # 第一次创建时 src 已经是 mp3_b64，但还需要 audio.update() 触发 dart 端 update()
             # （register_service 可能已经发送，但 on_state_change 等属性可能需要 update 同步）
             try:
                 audio.update()
@@ -347,31 +354,31 @@ class TTSEngine:
                 print(f"[TTS] audio.update() 异常: {ex}")
         else:
             audio = self._get_flet_audio()
-            # v1.0.39 关键修复：audioplayers Android 的 setSourceBytes 在 player 处于
-            # paused/playing 状态时不会重新加载新 source。必须先用 stop() 把 player
-            # 状态重置，再更新 src 并等待 on_loaded。
+            # v1.0.40：Audio 对象没有 stop() 方法，用 pause() + release() 把 player 状态重置，
+            # 然后设置新的 base64 字符串 src，让 dart 端重新加载新音频。
             try:
-                await audio.stop()
-                print("[TTS] 后续播放：已调用 stop() 重置 player")
+                await audio.pause()
+                await audio.release()
+                print("[TTS] 后续播放：已 pause() + release() 重置 player")
             except Exception as ex:
-                print(f"[TTS] 后续播放：stop() 异常(非致命): {ex}")
+                print(f"[TTS] 后续播放：pause/release 异常(非致命): {ex}")
             # 读取重置后的状态（诊断用）
             try:
                 pos_before = await audio.get_current_position()
                 pos_before_ms = pos_before.in_milliseconds if (pos_before and hasattr(pos_before, 'in_milliseconds')) else -1
-                print(f"[TTS] 后续播放：stop 后 position={pos_before_ms}ms, state_log={state_log}")
+                print(f"[TTS] 后续播放：release 后 position={pos_before_ms}ms, state_log={state_log}")
             except Exception as ex:
-                print(f"[TTS] 后续播放：stop 后读取状态失败(非致命): {ex}")
+                print(f"[TTS] 后续播放：release 后读取状态失败(非致命): {ex}")
             # 设置回调
             try:
                 audio.on_loaded = _on_loaded
                 audio.on_state_change = _on_state_change
             except Exception:
                 pass
-            # 后续播放，更新 src 为新的 bytes（v1.0.36：bytes 模式）
-            # dart 端 update() 检测到 bytes 变化 → _applySource() → setSourceBytes() → on_loaded
-            audio.src = mp3_bytes
-            print(f"[TTS] audio.src 已设置（bytes 模式，{len(mp3_bytes)} bytes）")
+            # 后续播放，更新 src 为新的 base64 字符串（v1.0.40：字符串模式，触发可靠变更检测）
+            # dart 端 update() 检测到 base64 字符串变化 → 解码为 bytes → _applySource() → setSourceBytes() → on_loaded
+            audio.src = mp3_b64
+            print(f"[TTS] audio.src 已设置（base64 字符串模式，{len(mp3_b64)} 字符）")
             try:
                 audio.update()
                 print("[TTS] audio.update() 已发送")
@@ -384,7 +391,7 @@ class TTSEngine:
             print("[TTS] 音频已加载（on_loaded 触发）")
         except asyncio.TimeoutError:
             print("[TTS] 警告：等待音频加载超时(5s)，仍尝试播放")
-            print("[TTS] 可能原因：1) mp3 bytes 损坏；2) 原生 audioplayers setSourceBytes 失败；3) dart 端 _applySource 异常")
+            print("[TTS] 可能原因：1) mp3 base64 损坏；2) 原生 audioplayers setSourceBytes 失败；3) dart 端 _applySource 异常")
             await asyncio.sleep(0.3)  # 兜底等待
         finally:
             # 清理 on_loaded 回调，避免重复触发
@@ -419,18 +426,13 @@ class TTSEngine:
         while elapsed < limit and not stop_event.is_set():
             await asyncio.sleep(step)
             elapsed += step
+        # v1.0.40：每段结束用 pause() + release() 重置 player（Audio 没有 stop() 方法）
         try:
-            await audio.stop()
-            print("[TTS] 播放结束：已调用 stop() 重置 player（保持 AudioPlayer 实例可用）")
+            await audio.pause()
+            await audio.release()
+            print("[TTS] 播放结束：已 pause() + release() 重置 player（保持 AudioPlayer 实例可用）")
         except Exception:
             pass
-        # v1.0.39：每段结束调用 stop() 而不是 pause()，让 MediaPlayer 状态重置，
-        # 下一段 setSourceBytes(newBytes) 才能重新加载。pause() 会保留已加载 source，
-        # 导致后续段继续播放旧音频。release() 会释放原生资源，导致下一段无法重新加载。
-        # try:
-        #     await audio.release()
-        # except Exception:
-        #     pass
         # 清理状态监听
         try:
             audio.on_state_change = None
