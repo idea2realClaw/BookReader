@@ -665,21 +665,27 @@ class BookViewer(ft.Container):
         - 逐句高亮等待以"真实音频播完"为准（done_task），估算时长偏长时提前结束，
           消除翻页前的静音停顿。
         """
-        # ---- ping-pong 双缓冲朗读（v1.0.41）----
-        # 第 1 段：完全沿用"首段方法"（创建 Audio + 加载）完整播放，保持不变。
-        # 第 2 段起：两个固定缓冲文件 tmpbookreader1/2.mp3 交替——
-        #   不等上段播完就并行合成下一段到"另一缓冲"，删掉已读完的旧文件，
-        #   再按首段方法完整播放新缓冲；如此交替，直到读完。
+        # ---- v1.0.42：每段新建独立 Audio 控件 + ping-pong 双缓冲预取 ----
+        # 每段都走"创建 Audio + 加载"的可靠路径（真机 100% 出声），因此不再有
+        # "首段/后续段"之分；ping-pong 仅用于翻页零等待（不等合成）。
+        # 不变量：buf[cur_buf] 永远装着"当前段"的音频——
+        #   首段预合成到 buf[0]；后续段由上一段的并行任务合成到 buf[1-cur_buf]。
         tmp_dir = self.tts._mp3_temp_dir()
         buf_paths = [
             os.path.join(tmp_dir, "tmpbookreader1.mp3"),
             os.path.join(tmp_dir, "tmpbookreader2.mp3"),
         ]
         first_page = True
-        first_seg = True        # 仅第 1 段为 True（走创建 Audio 的首段方法）
-        last_synth_idx = 0     # 上一次合成写入的缓冲下标（即"当前段音频"所在缓冲）
-        pending = None          # 下一段的并行合成任务
-        free_idx = -1          # 该任务写入的缓冲下标
+        cur_buf = 0           # 当前段音频所在缓冲下标
+        pending = None         # 下一段的并行合成任务
+
+        # 预合成首段（含可能的 resume 起始句）到 buf[0]
+        text0 = self.pages[self.current]
+        sentences0 = self._split_into_sentences_with_offsets(text0)
+        start_idx0 = start_sentence if first_page else 0
+        seg0 = text0[sentences0[start_idx0][1]:] if start_idx0 > 0 else text0
+        await self.tts.synthesize_to_path_named(seg0, buf_paths[0])
+
         while self._is_reading and not self._tts_stop_event.is_set():
             try:
                 # 获取当前页文本（窗口分页后的可视页）
@@ -711,22 +717,19 @@ class BookViewer(ft.Container):
                 first_page = False
 
                 if start_idx <= 0:
-                    # 从本页第一句开始：整页一次性朗读
                     speak_text = text
-                    local_base = 0
                 else:
-                    # 从选中句开始：拼接选中句及之后所有句
                     speak_text = text[sentences[start_idx][1]:]
-                    local_base = sentences[start_idx][1]
 
                 durations = [estimate_duration(s) for s, _ in sentences]
 
-                # 第 1 段：合成到 buf[0] 并完整播放（首段方法，完全不变）
-                if first_seg:
-                    mp3 = await self.tts.synthesize_to_path_named(speak_text, buf_paths[0])
+                # 当前段音频在 buf[cur_buf]（首段预合成 / 上一段并行合成好）
+                mp3 = buf_paths[cur_buf]
+                if not os.path.exists(mp3):
+                    # 预取失败兜底：现场合成到当前缓冲
+                    mp3 = await self.tts.synthesize_to_path_named(speak_text, buf_paths[cur_buf])
                     if mp3 is None:
-                        # 合成失败：按估算时长静默停顿后翻页
-                        await self._wait(durations[0] if durations else 0.0, self._tts_stop_event)
+                        await self._wait(sum(durations) if durations else 0.0, self._tts_stop_event)
                         if self._tts_stop_event.is_set():
                             break
                         if self.current < len(self.pages) - 1:
@@ -735,33 +738,20 @@ class BookViewer(ft.Container):
                         else:
                             break
                         continue
-                    last_synth_idx = 0
-                else:
-                    # 后续段：当前段音频已由上一次并行合成写入 buf[last_synth_idx]
-                    mp3 = buf_paths[last_synth_idx]
-                    # 删掉"已读完的旧文件"——另一个缓冲（上上段所在，已播放完毕）
-                    old_idx = 1 - last_synth_idx
-                    if os.path.exists(buf_paths[old_idx]):
-                        try:
-                            os.unlink(buf_paths[old_idx])
-                            print(f"[BookViewer] 已删除旧缓冲 tmpbookreader{old_idx + 1}.mp3")
-                        except Exception:
-                            pass
 
-                # 并行合成"下一段"到空闲缓冲（不等当前段播完），翻页后直接播放
+                # 并行合成"下一段"到另一缓冲（翻页零等待；通常播放期间已完成）
+                other = 1 - cur_buf
                 nxt = self.current + 1
                 if nxt < len(self.pages):
-                    free_idx = 1 - last_synth_idx
                     pending = asyncio.create_task(
-                        self.tts.synthesize_to_path_named(self.pages[nxt], buf_paths[free_idx])
+                        self.tts.synthesize_to_path_named(self.pages[nxt], buf_paths[other])
                     )
                 else:
                     pending = None
-                    free_idx = -1
 
-                # 完整播放当前段 mp3：第 1 段用"创建 Audio"的首段方法，后续段用重载路径
+                # 完整播放当前段 mp3（每段新建独立 Audio，可靠出声）
                 speak_task = asyncio.create_task(
-                    self._speak_text_from_file(speak_text, mp3, is_first=first_seg)
+                    self._speak_text_from_file(speak_text, mp3)
                 )
 
                 # 逐句高亮 + 记录位置，与朗读节奏同步；整页播完则提前结束等待
@@ -780,14 +770,12 @@ class BookViewer(ft.Container):
                 except Exception as ex:
                     print(f"[BookViewer] 朗读任务异常: {ex}")
 
-                # 等待下一段并行合成完成（通常播放期间已完成），并切换到该缓冲
+                # 等待下一段并行合成完成（通常已完成）
                 if pending is not None:
                     try:
                         res = await pending
                         if res is None:
                             print("[BookViewer] 下一段合成失败")
-                        else:
-                            last_synth_idx = free_idx
                     except Exception as ex:
                         print(f"[BookViewer] 并行合成异常: {ex}")
                     pending = None
@@ -795,8 +783,14 @@ class BookViewer(ft.Container):
                 if self._tts_stop_event.is_set():
                     break
 
-                # 标记首段已结束（此后一律走重载路径）
-                first_seg = False
+                # 删除"已播放"的当前缓冲，并切换到下一段已合成好的另一缓冲
+                try:
+                    if os.path.exists(buf_paths[cur_buf]):
+                        os.unlink(buf_paths[cur_buf])
+                        print(f"[BookViewer] 已删除旧缓冲 tmpbookreader{cur_buf + 1}.mp3")
+                except Exception:
+                    pass
+                cur_buf = 1 - cur_buf
 
                 # 自动翻页
                 if self.current < len(self.pages) - 1:
@@ -861,17 +855,14 @@ class BookViewer(ft.Container):
             import traceback
             traceback.print_exc()
 
-    async def _speak_text_from_file(self, text: str, mp3_path, is_first: bool):
-        """用跨平台 TTS 播放已合成好的 mp3 文件（ping-pong 方案核心）。
-
-        is_first=True 走"创建 Audio + 加载"的**首段方法**（经实测可靠出声）；
-        is_first=False 复用已有 Audio 对象、重载新 base64 内容（第 2 段起）。"""
+    async def _speak_text_from_file(self, text: str, mp3_path):
+        """用跨平台 TTS 播放已合成好的 mp3 文件（每段都走"新建 Audio"的可靠路径）。"""
         if not text.strip():
             return
 
-        print(f"[BookViewer] TTS朗读(段): {len(text)} 字符, is_first={is_first}")
+        print(f"[BookViewer] TTS朗读(段): {len(text)} 字符")
         try:
-            await self.tts.speak_file(mp3_path, self._tts_stop_event, is_first=is_first)
+            await self.tts.speak_file(mp3_path, self._tts_stop_event)
         except Exception as ex:
             print(f"[BookViewer] TTS错误: {ex}")
             import traceback

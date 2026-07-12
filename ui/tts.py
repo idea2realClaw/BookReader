@@ -182,6 +182,65 @@ class TTSEngine:
         except Exception:
             pass
 
+    def _create_flet_audio(self, initial_src, on_loaded=None, on_state_change=None):
+        """创建并注册一个全新的 flet_audio.Audio 控件（每段独立，绕开复用重载失效）。
+
+        v1.0.42：复用同一个 Audio 控件、仅更新 src 时，真机上第 2 段起永远
+        不触发 on_loaded（Flet 对超大 base64 字符串属性的 diff 不触发 dart 端
+        重载）。改为每段新建独立控件——首段"创建 Audio + 注册 + 等 on_loaded"这条路
+        在真机 100% 可靠出声，on_loaded 触发即证明控件已到达 dart 侧。"""
+        if initial_src is None:
+            raise ValueError("创建 Audio 必须传入 initial_src（mp3 base64 字符串）")
+        kwargs = dict(
+            src=initial_src,
+            volume=1.0,
+            autoplay=False,
+            release_mode=_FTA.ReleaseMode.STOP,
+        )
+        if on_loaded is not None:
+            kwargs["on_loaded"] = on_loaded
+        if on_state_change is not None:
+            kwargs["on_state_change"] = on_state_change
+        audio = _FTA.Audio(**kwargs)
+        try:
+            self.page._services.register_service(audio)
+            try:
+                n = len(self.page._services._services)
+                print(f"[TTS] flet_audio service 已注册 (registry size={n})")
+            except Exception as diag_ex:
+                print(f"[TTS] flet_audio service 已注册 (无法读取 registry size: {diag_ex})")
+            try:
+                print(f"[TTS] audio.page={audio.page is not None}, audio._i={getattr(audio, '_i', '?')}")
+            except Exception:
+                pass
+        except Exception as ex:
+            print(f"[TTS] 注册 flet_audio service 失败: {ex}")
+            print("[TTS] 可能原因：pyproject.toml 缺少 [tool.flet.flutter.dependencies] flet_audio 声明")
+        return audio
+
+    async def _dispose_flet_audio(self):
+        """销毁上一段的 Audio 控件，避免 ServiceRegistry / dart 侧 AudioPlayer 无限累积。
+
+        步骤：pause + release 释放原生 player 资源 → 解除 self._audio 引用 →
+        尽力从 registry 移除（引用计数清理）。即使未移除，release() 已释放原生资源，
+        单次阅读会话（≤ 数十段）累积可接受。"""
+        a = self._audio
+        if a is None:
+            return
+        try:
+            await a.pause()
+        except Exception:
+            pass
+        try:
+            await a.release()
+        except Exception:
+            pass
+        self._audio = None
+        try:
+            self.page._services.unregister_services()
+        except Exception:
+            pass
+
     def _get_flet_audio(self, initial_src=None, on_loaded=None, on_state_change=None):
         """懒创建并注册一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。
         返回 audio。首次创建后需给原生控件一点注册时间再播放。
@@ -281,7 +340,7 @@ class TTSEngine:
             # 清理回调，避免重复触发
             audio.on_loaded = None
 
-    async def _play_flet_audio(self, mp3_path: str, duration: float, stop_event, is_first: bool = False):
+    async def _play_flet_audio(self, mp3_path: str, duration: float, stop_event):
         """用 flet_audio 播放本地 mp3 文件，等待播放结束（或停止信号）。
 
         v1.0.40 关键修复：把 mp3 bytes 转为 base64 字符串作为 src。
@@ -308,7 +367,9 @@ class TTSEngine:
             print(f"[TTS] 读取 mp3 文件失败: {ex}")
             raise
 
-        is_first_play = is_first if is_first is not None else (self._audio is None)
+        # v1.0.42：每段都销毁上一段的旧 Audio，再新建一个独立控件。
+        # 复用控件重载在真机失效（Flet 对超大 base64 字符串 diff 不触发 dart 重载）。
+        await self._dispose_flet_audio()
 
         # 创建 on_loaded future（必须在创建/更新 audio 之前设置回调）
         # 原因：register_service 可能把 audio 立即发送到原生侧，dart 端 init() → _applySource()
@@ -331,83 +392,42 @@ class TTSEngine:
             state_log.append(state)
             print(f"[TTS] audio on_state_change: {state}")
 
-        if is_first_play:
-            # 第一次创建：直接用 mp3 base64 字符串作为 initial_src，并在创建时设置 on_loaded 回调
-            # dart 端 init() → update() → _applySource() → setSourceBytes(decoded bytes)
-            # 加载成功后触发 on_loaded 事件，audio_player 进入 ready 状态
-            audio = self._get_flet_audio(
-                initial_src=mp3_b64,  # ← base64 字符串模式，dart 端解码为 bytes
-                on_loaded=_on_loaded,
-                on_state_change=_on_state_change,
-            )
-            just_registered = getattr(self, "_audio_just_registered", False)
-            if just_registered:
-                # 原生 Audio service 首次注册需要一点时间，否则首句可能无声
-                await asyncio.sleep(0.5)
-                self._audio_just_registered = False
-            print(f"[TTS] 首次播放，audio.src 已在创建时设置（base64 字符串模式，{len(mp3_b64)} 字符）")
-            # 第一次创建时 src 已经是 mp3_b64，但还需要 audio.update() 触发 dart 端 update()
-            # （register_service 可能已经发送，但 on_state_change 等属性可能需要 update 同步）
-            try:
-                audio.update()
-            except Exception as ex:
-                print(f"[TTS] audio.update() 异常: {ex}")
-        else:
-            audio = self._get_flet_audio()
-            # v1.0.40：Audio 对象没有 stop() 方法，用 pause() + release() 把 player 状态重置，
-            # 然后设置新的 base64 字符串 src，让 dart 端重新加载新音频。
-            try:
-                await audio.pause()
-                await audio.release()
-                print("[TTS] 后续播放：已 pause() + release() 重置 player")
-            except Exception as ex:
-                print(f"[TTS] 后续播放：pause/release 异常(非致命): {ex}")
-            # 读取重置后的状态（诊断用）
-            try:
-                pos_before = await audio.get_current_position()
-                pos_before_ms = pos_before.in_milliseconds if (pos_before and hasattr(pos_before, 'in_milliseconds')) else -1
-                print(f"[TTS] 后续播放：release 后 position={pos_before_ms}ms, state_log={state_log}")
-            except Exception as ex:
-                print(f"[TTS] 后续播放：release 后读取状态失败(非致命): {ex}")
-            # 设置回调
-            try:
-                audio.on_loaded = _on_loaded
-                audio.on_state_change = _on_state_change
-            except Exception:
-                pass
-            # 后续播放，更新 src 为新的 base64 字符串（v1.0.40：字符串模式，触发可靠变更检测）
-            # dart 端 update() 检测到 base64 字符串变化 → 解码为 bytes → _applySource() → setSourceBytes() → on_loaded
-            audio.src = mp3_b64
-            print(f"[TTS] audio.src 已设置（base64 字符串模式，{len(mp3_b64)} 字符）")
-            try:
-                audio.update()
-                print("[TTS] audio.update() 已发送")
-            except Exception as ex:
-                print(f"[TTS] audio.update() 异常: {ex}")
-
-        # 等待 on_loaded 事件（原生 _applySource 完成后触发），最多等 5 秒
+        # 每段都新建一个独立的 Audio 控件（"首段方法"，真机 100% 可靠出声）。
+        # on_loaded 触发即证明控件已到达 dart 侧，绝不会出现 inexistent control。
+        audio = self._create_flet_audio(
+            initial_src=mp3_b64,  # ← base64 字符串模式，dart 端解码为 bytes → setSourceBytes
+            on_loaded=_on_loaded,
+            on_state_change=_on_state_change,
+        )
+        self._audio = audio
+        # 原生 Audio service 首次注册需要一点时间，否则首句可能无声
+        await asyncio.sleep(0.5)
+        print(f"[TTS] 新建 Audio（每段独立控件），base64 长度 {len(mp3_b64)} 字符")
         try:
-            await asyncio.wait_for(loaded_future, timeout=5.0)
+            audio.update()
+        except Exception as ex:
+            print(f"[TTS] audio.update() 异常: {ex}")
+
+        # 等待 on_loaded 事件（原生 _applySource 完成后触发），最多等 8 秒
+        # on_loaded 触发即证明控件已到达 dart 侧；超时则重试一次 update
+        try:
+            await asyncio.wait_for(loaded_future, timeout=8.0)
             print("[TTS] 音频已加载（on_loaded 触发）")
         except asyncio.TimeoutError:
-            if not is_first_play:
-                # 非首段重载偶发丢失 update：重试一次，强制 dart 端重新 setSourceBytes
-                print("[TTS] 非首段首次等待加载超时，重试 update 一次")
-                try:
-                    audio.src = mp3_b64
-                    audio.update()
-                except Exception as ex:
-                    print(f"[TTS] 重试 update 异常: {ex}")
-                try:
-                    await asyncio.wait_for(loaded_future, timeout=3.0)
-                    print("[TTS] 重试后音频已加载（on_loaded 触发）")
-                except asyncio.TimeoutError:
-                    print("[TTS] 警告：重试后仍超时，仍尝试播放")
-                    await asyncio.sleep(0.3)
-            else:
-                print("[TTS] 警告：等待音频加载超时(5s)，仍尝试播放")
+            # 偶发：控件已注册但 dart 端尚未完成 setSourceBytes，重试一次 update
+            print("[TTS] 警告：等待音频加载超时(8s)，重试 update 一次")
+            try:
+                audio.src = mp3_b64
+                audio.update()
+            except Exception as ex:
+                print(f"[TTS] 重试 update 异常: {ex}")
+            try:
+                await asyncio.wait_for(loaded_future, timeout=5.0)
+                print("[TTS] 重试后音频已加载（on_loaded 触发）")
+            except asyncio.TimeoutError:
+                print("[TTS] 警告：重试后仍超时，仍尝试播放")
                 print("[TTS] 可能原因：1) mp3 base64 损坏；2) 原生 audioplayers setSourceBytes 失败；3) dart 端 _applySource 异常")
-                await asyncio.sleep(0.3)  # 兜底等待
+                await asyncio.sleep(0.3)
         finally:
             # 清理 on_loaded 回调，避免重复触发
             try:
@@ -521,13 +541,9 @@ class TTSEngine:
                 print(f"[TTS] gTTS 写入指定路径失败: {ex}")
         return None
 
-    async def speak_file(self, mp3_path: str, stop_event, is_first: Optional[bool] = None,
+    async def speak_file(self, mp3_path: str, stop_event,
                         duration: Optional[float] = None) -> float:
-        """直接播放已合成好的 mp3 文件（ping-pong 方案的核心入口）。
-
-        is_first=True  →  走"首次创建 Audio 并加载"的**首段方法**（经实测可靠出声）；
-        is_first=False →  复用已有 Audio 对象、重载新 base64 内容（第 2 段起）；
-        is_first=None  →  自动判断（无 Audio 即视为首段）。
+        """直接播放已合成好的 mp3 文件（每段都新建独立 Audio 控件，可靠出声）。
 
         桌面端：直接用 pygame 播放该文件（不经过 flet_audio）。"""
         if mp3_path is None or not os.path.exists(mp3_path):
@@ -538,11 +554,9 @@ class TTSEngine:
             await self._play_pygame(mp3_path, stop_event, d)
             return d
         d = duration if duration is not None else _estimate_duration("")
-        if is_first is None:
-            is_first = (self._audio is None)
         async with self._play_lock:
             try:
-                await self._play_flet_audio(mp3_path, d, stop_event, is_first=is_first)
+                await self._play_flet_audio(mp3_path, d, stop_event)
             except Exception as ex:
                 print(f"[TTS] flet_audio 播放失败，回退系统播放器(file://): {ex}")
                 try:
