@@ -171,8 +171,10 @@ class TTSEngine:
             pass
 
     async def _stop_flet_audio_async(self, a):
+        # v1.0.39：停止朗读时调用 stop() 而不是 pause()，把 player 状态重置，
+        # 下次从干净状态开始，避免继续播放旧音频。
         try:
-            await a.pause()
+            await a.stop()
         except Exception:
             pass
         try:
@@ -345,19 +347,27 @@ class TTSEngine:
                 print(f"[TTS] audio.update() 异常: {ex}")
         else:
             audio = self._get_flet_audio()
+            # v1.0.39 关键修复：audioplayers Android 的 setSourceBytes 在 player 处于
+            # paused/playing 状态时不会重新加载新 source。必须先用 stop() 把 player
+            # 状态重置，再更新 src 并等待 on_loaded。
+            try:
+                await audio.stop()
+                print("[TTS] 后续播放：已调用 stop() 重置 player")
+            except Exception as ex:
+                print(f"[TTS] 后续播放：stop() 异常(非致命): {ex}")
+            # 读取重置后的状态（诊断用）
+            try:
+                pos_before = await audio.get_current_position()
+                pos_before_ms = pos_before.in_milliseconds if (pos_before and hasattr(pos_before, 'in_milliseconds')) else -1
+                print(f"[TTS] 后续播放：stop 后 position={pos_before_ms}ms, state_log={state_log}")
+            except Exception as ex:
+                print(f"[TTS] 后续播放：stop 后读取状态失败(非致命): {ex}")
             # 设置回调
             try:
                 audio.on_loaded = _on_loaded
                 audio.on_state_change = _on_state_change
             except Exception:
                 pass
-            # v1.0.38 诊断：先读取当前状态，判断 player 是否处于可重新加载状态
-            try:
-                pos_before = await audio.get_current_position()
-                pos_before_ms = pos_before.in_milliseconds if (pos_before and hasattr(pos_before, 'in_milliseconds')) else -1
-                print(f"[TTS] 后续播放：更新 src 前 position={pos_before_ms}ms, state_log={state_log}")
-            except Exception as ex:
-                print(f"[TTS] 后续播放：更新 src 前读取状态失败(非致命): {ex}")
             # 后续播放，更新 src 为新的 bytes（v1.0.36：bytes 模式）
             # dart 端 update() 检测到 bytes 变化 → _applySource() → setSourceBytes() → on_loaded
             audio.src = mp3_bytes
@@ -410,11 +420,13 @@ class TTSEngine:
             await asyncio.sleep(step)
             elapsed += step
         try:
-            await audio.pause()
+            await audio.stop()
+            print("[TTS] 播放结束：已调用 stop() 重置 player（保持 AudioPlayer 实例可用）")
         except Exception:
             pass
-        # v1.0.38：不再 release()，保持 AudioPlayer 实例可用，让下一段 setSourceBytes 能重新加载。
-        # v1.0.36 每段后 release() 会释放原生 MediaPlayer，疑似导致后续段 setSourceBytes 失败。
+        # v1.0.39：每段结束调用 stop() 而不是 pause()，让 MediaPlayer 状态重置，
+        # 下一段 setSourceBytes(newBytes) 才能重新加载。pause() 会保留已加载 source，
+        # 导致后续段继续播放旧音频。release() 会释放原生资源，导致下一段无法重新加载。
         # try:
         #     await audio.release()
         # except Exception:
