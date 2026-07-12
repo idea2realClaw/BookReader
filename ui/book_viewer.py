@@ -665,13 +665,15 @@ class BookViewer(ft.Container):
         - 逐句高亮等待以"真实音频播完"为准（done_task），估算时长偏长时提前结束，
           消除翻页前的静音停顿。
         """
-        # ---- 移动端：整本连续朗读（v1.0.44）----
-        # flet_audio 在安卓上只有【第一个】AudioPlayer 可靠出声（后续段 / 第二个 player
-        # 因原生 MediaPlayer 资源冲突而 on_loaded 永不触发 → 静音）。根因经 11 个版本
-        # + 日志铁证确认。故移动端改为"整本拼成一个 mp3、单个 player 一次性播完"，
-        # 全程只走那个 100% 可靠的首段播放路径；句子高亮仍用估算时长计时驱动。
+        # ---- 移动端：单 Audio + COMPLETED 事件链顺序播放（v1.0.45）----
+        # 按师父架构：页面只创建【一个】Audio 控件，监听 on_state_change 的
+        # COMPLETED 事件驱动下一首（play_next）；切歌时改 src + play()、不手动
+        # release（ExoPlayer 处理换源）；不用 time.sleep / for 循环硬等。
+        # 边播边转（合成一句~1s，与播放并行），零整本预处理延迟。
+        # （v1.0.44 的整本 concat 仍保留在 _read_all_mobile_continuous，
+        #  若本方案在真机失败可一行切回兜底。）
         if self.tts._is_mobile():
-            await self._read_all_mobile_continuous(start_sentence)
+            await self._read_all_mobile_sequential(start_sentence)
             return
         # ---- 桌面端：逐段朗读（pygame 无 player 冲突问题）----
         # 每段都走"创建 Audio + 加载"的可靠路径（真机 100% 出声），因此不再有
@@ -851,7 +853,75 @@ class BookViewer(ft.Container):
         self._save_position()
 
     # ==================================================================
+    # 移动端单 Audio + COMPLETED 事件链顺序朗读（v1.0.45）
+    # ==================================================================
+    async def _read_all_mobile_sequential(self, start_sentence=0):
+        """移动端单 Audio + COMPLETED 事件链顺序朗读（v1.0.45，按师父架构）。
+
+        页面只创建一个 flet_audio.Audio 控件；play_sequential 监听
+        on_state_change 的 COMPLETED 事件驱动下一句（play_next），
+        切句时改 src + play()、不手动 release（ExoPlayer 处理换源）；
+        不用 time.sleep / for 循环硬等。
+
+        句子高亮由 play_sequential 的 on_seg_start 回调（每段开始播放时
+        触发）事件驱动：保存位置 + 自动翻页 + 高亮当前句。彻底
+        绕开 v1.0.36~v1.0.43 所有"复用重载 / 第二个 player"坑——
+        因为本方案【不 release】，ExoPlayer 自行处理换源，等于每段都走
+        "首段创建"的可靠路径（首段 100% 出声已被反复验证）。"""
+        # 1) 收集剩余句子（文本 + 绝对字符偏移），跨页拼成扁平列表
+        all_sent = []  # [(text, abs_offset), ...]
+        first_page = True
+        for pi in range(self.current, len(self.pages)):
+            text = self.pages[pi]
+            if not text.strip():
+                continue
+            sents = self._split_into_sentences_with_offsets(text)
+            if not sents:
+                continue
+            sidx = start_sentence if first_page else 0
+            base = self._page_start_offsets[pi]
+            for j in range(sidx, len(sents)):
+                s_text = sents[j][0]
+                if not s_text.strip():
+                    continue
+                all_sent.append((s_text, base + sents[j][1]))
+            first_page = False
+
+        if not all_sent:
+            print("[BookViewer] 无可读句子，停止顺序朗读")
+            self._finalize_reading()
+            return
+
+        texts = [s for s, _ in all_sent]
+        offsets = [o for _, o in all_sent]
+        print(f"[BookViewer] 顺序朗读：共 {len(texts)} 句"
+              f"（单 Audio + COMPLETED 事件链，边播边转）")
+
+        # 2) on_seg_start 回调：每段开始播放时由 play_sequential 触发
+        #    （事件驱动，不用硬等）——保存位置 + 自动翻页 + 高亮当前句
+        def on_seg_start(idx, text):
+            if idx >= len(offsets):
+                return
+            off = offsets[idx]
+            self._save_position(off)
+            self._ensure_page_for_offset(off)
+            try:
+                si = self._sentence_index_at_offset(self.current, off)
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._highlight_sentence(si))
+            except Exception as ex:
+                print(f"[BookViewer] 高亮调度异常: {ex}")
+
+        # 3) 单 Audio 顺序播放（事件驱动，边播边转；桌面端走 pygame）
+        await self.tts.play_sequential(
+            texts, self._tts_stop_event, on_seg_start=on_seg_start
+        )
+        self._finalize_reading()
+        print("[BookViewer] 顺序朗读结束")
+
+    # ==================================================================
     # 移动端整本连续朗读（v1.0.44）：单个 player 播完整场
+    # （v1.0.45 起作为顺序朗读失败时的兜底，未默认启用）
     # ==================================================================
     def _ensure_page_for_offset(self, global_offset: int):
         """若 global_offset 不在当前页，翻到对应页（连续朗读用）。"""

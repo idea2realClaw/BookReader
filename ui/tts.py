@@ -50,6 +50,12 @@ try:
 except Exception:  # pragma: no cover
     _FTA = None
 
+# AudioState 枚举（COMPLETED 等），用于"单 Audio + COMPLETED 事件链"顺序播放。
+try:
+    from flet_audio.types import AudioState as _AudioState
+except Exception:  # pragma: no cover
+    _AudioState = None
+
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 # 音色映射：男 / 女（缺省男）。各种语言给出 Edge TTS 标准神经语音。
@@ -720,6 +726,206 @@ class TTSEngine:
             except Exception:
                 pass
             self._audio = None
+
+    # ==================================================================
+    # 单 Audio + COMPLETED 事件链顺序播放（v1.0.45，按师父架构）
+    # 不用 release（ExoPlayer 自行处理换源），不用硬等 on_loaded
+    # （用 COMPLETED 链驱动）。边播边转，零整本预处理延迟。
+    # ==================================================================
+    async def play_sequential(self, segments, stop_event, on_seg_start=None):
+        """单 flet_audio.Audio 控件 + COMPLETED 事件链驱动顺序播放。
+
+        架构（师父指定）：
+        - 页面【只创建一个】Audio 控件；切歌时改 src 并 play()，
+          避免重复实例化丢失状态。
+        - 监听 on_state_change 的 COMPLETED 事件来驱动下一首（play_next），
+          切勿用 time.sleep / for 循环硬等。
+        - 复用同一 Audio 控件【不手动 release】（ExoPlayer 会处理换源）。
+
+        实测结论：v1.0.41 的毒药是切歌前调了 pause()+release()，
+        把 player 撕碎后 setSourceBytes 在 Android 抛异常 → on_loaded 永不触发。
+        本方法去掉 release，仅 audio.src = 新base64 + update() + play()。
+
+        segments：句子文本列表（每段一句）。on_seg_start(idx, text) 可选回调，
+        在每段开始播放时调用（UI 高亮 + 翻页）。"""
+        if not segments:
+            return
+        # 桌面端：逐段 pygame（无 player 冲突），直接逐句播
+        if not self._is_mobile():
+            for i, s in enumerate(segments):
+                if stop_event.is_set():
+                    break
+                if on_seg_start is not None:
+                    try:
+                        on_seg_start(i, s)
+                    except Exception:
+                        pass
+                await self._speak_edge(s, stop_event)
+            return
+
+        # ---- 移动端：单 Audio + COMPLETED 事件链 ----
+        loop = asyncio.get_event_loop()
+        loaded_future = loop.create_future()
+        completed_holder = [loop.create_future()]  # 当前段播完置位
+
+        def _b64_of(p):
+            with open(p, "rb") as f:
+                data = f.read()
+            return base64.b64encode(data).decode("ascii"), hash(data[:16])
+
+        def _on_loaded(e):
+            print("[TTS] audio on_loaded 触发（顺序播放）")
+            if not loaded_future.done():
+                loaded_future.set_result(True)
+
+        def _on_state(e):
+            st = getattr(e, "state", None)
+            if st is None:
+                st = getattr(e, "data", None)
+            print(f"[TTS] audio on_state_change: {st}")
+            is_completed = (st == "completed") or (
+                _AudioState is not None and st == _AudioState.COMPLETED
+            )
+            if is_completed:
+                if not completed_holder[0].done():
+                    completed_holder[0].set_result(True)
+
+        # 先合成第 0 段（创建 Audio 必须非空 src）
+        mp3_0 = await self._synthesize_mobile_to_file(segments[0])
+        if mp3_0 is None:
+            print("[TTS] 顺序播放：首段合成失败，回退静默计时")
+            for s in segments:
+                if stop_event.is_set():
+                    break
+                await self._wait(_estimate_duration(s), stop_event)
+            return
+        b64_0, hash_0 = _b64_of(mp3_0)
+        try:
+            os.unlink(mp3_0)
+        except Exception:
+            pass
+
+        # 创建【单个】Audio（首段可靠路径：src 非空 + on_loaded/on_state 创建时设）
+        audio = self._create_flet_audio(
+            initial_src=b64_0,
+            on_loaded=_on_loaded,
+            on_state_change=_on_state,
+        )
+        self._audio = audio
+        print(f"[TTS] 顺序播放：创建【单】Audio，首段 base64={len(b64_0)} 字符, "
+              f"hash={hash_0}")
+        await asyncio.sleep(0.5)  # 原生注册缓冲
+        try:
+            audio.update()
+        except Exception as ex:
+            print(f"[TTS] audio.update() 异常: {ex}")
+
+        # 等首段加载（最多 8s；即使 on_loaded 没到也尝试播）
+        try:
+            await asyncio.wait_for(loaded_future, timeout=8.0)
+            print("[TTS] 顺序播放：首段已加载")
+        except asyncio.TimeoutError:
+            print("[TTS] 警告：首段加载超时(8s)，仍尝试播放")
+
+        if stop_event.is_set():
+            return
+
+        if on_seg_start is not None:
+            try:
+                on_seg_start(0, segments[0])
+            except Exception as ex:
+                print(f"[BookViewer] on_seg_start 回调异常(非致命): {ex}")
+
+        try:
+            await audio.play()
+            print("[TTS] 顺序播放：audio.play()(段0) 已调用")
+        except Exception as ex:
+            print(f"[TTS] 段0 audio.play() 异常: {ex}")
+            return
+
+        # 预合成第 1 段（段0 播放期间并行，消除段间间隙）
+        next_task = None
+        if len(segments) > 1:
+            next_task = asyncio.create_task(
+                self._synthesize_mobile_to_file(segments[1])
+            )
+
+        # 事件链主循环：COMPLETED → 合成下一段 → 换 src → play()
+        idx = 0
+        while idx < len(segments) - 1 and not stop_event.is_set():
+            completed_holder[0] = loop.create_future()
+            try:
+                await asyncio.wait_for(
+                    completed_holder[0],
+                    timeout=_estimate_duration(segments[idx]) + 30.0,
+                )
+            except asyncio.TimeoutError:
+                print(f"[TTS] 警告：段{idx} 未在预期内 COMPLETED，尝试继续")
+            if stop_event.is_set():
+                break
+            nxt = idx + 1
+            if nxt >= len(segments):
+                break
+            # 取预合成好的下一段（通常段0 播放期间已完成）
+            mp3_next = None
+            if next_task is not None:
+                try:
+                    mp3_next = await next_task
+                except Exception as ex:
+                    print(f"[TTS] 预合成段{nxt} 失败: {ex}")
+            if mp3_next is None:
+                mp3_next = await self._synthesize_mobile_to_file(segments[nxt])
+            if mp3_next is None:
+                print(f"[TTS] 段{nxt} 合成失败，静默跳过")
+                idx = nxt
+                continue
+            b64_next, hash_next = _b64_of(mp3_next)
+            try:
+                os.unlink(mp3_next)
+            except Exception:
+                pass
+
+            # ★ 关键：不 release，直接换 src + play()（ExoPlayer 处理换源）
+            audio.src = b64_next
+            audio.update()
+            print(f"[TTS] 顺序播放：换 src 播段{nxt}，base64={len(b64_next)} 字符, hash={hash_next}")
+
+            if on_seg_start is not None:
+                try:
+                    on_seg_start(nxt, segments[nxt])
+                except Exception as ex:
+                    print(f"[BookViewer] on_seg_start 回调异常(非致命): {ex}")
+
+            try:
+                await audio.play()
+                print(f"[TTS] 顺序播放：audio.play()(段{nxt}) 已调用")
+            except Exception as ex:
+                print(f"[TTS] 段{nxt} audio.play() 异常: {ex}")
+                break
+
+            # 诊断：0.5s 后检查是否真在播（position>0 = 换源成功出声）
+            try:
+                await asyncio.sleep(0.5)
+                pos = await audio.get_current_position()
+                pos_ms = pos.in_milliseconds if (pos and hasattr(pos, "in_milliseconds")) else 0
+                print(f"[TTS] 顺序播放：段{nxt} 播放中 position={pos_ms}ms "
+                      f"({'出声OK' if pos_ms > 0 else '警告：position=0 可能无声'})")
+            except Exception as ex:
+                print(f"[TTS] 读取段{nxt} 播放位置失败(非致命): {ex}")
+
+            # 预合成下下一段
+            nxt2 = nxt + 1
+            next_task = asyncio.create_task(
+                self._synthesize_mobile_to_file(segments[nxt2])
+            ) if nxt2 < len(segments) else None
+            idx = nxt
+
+        # 收尾：暂停（不 release，按用户架构；页面 on_unmount 时再 release）
+        try:
+            await audio.pause()
+            print("[TTS] 顺序播放结束：已 pause()（未 release，单 Audio 复用）")
+        except Exception:
+            pass
 
     async def speak_file(self, mp3_path: str, stop_event,
                         duration: Optional[float] = None) -> float:
