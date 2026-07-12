@@ -568,6 +568,159 @@ class TTSEngine:
                 print(f"[TTS] gTTS 写入指定路径失败: {ex}")
         return None
 
+    # ==================================================================
+    # 整本连续朗读（v1.0.44）：只用一个 AudioPlayer 播完整场
+    # ==================================================================
+    async def _synthesize_bytes(self, text: str) -> Optional[bytes]:
+        """合成 text 为 mp3 字节（优先 Edge TTS，失败回退 gTTS）。"""
+        text = (text or "").strip()
+        if not text:
+            return None
+        if _edge_lite_synthesize is not None:
+            try:
+                mp3 = await _edge_lite_synthesize(
+                    text, self._voice_id(text), _rate_string(self.speed)
+                )
+                if mp3:
+                    return mp3
+            except Exception as ex:
+                print(f"[TTS] Edge 合成失败，回退 gTTS: {ex}")
+        if _GTTS is not None:
+            try:
+                fd, tmp = self._new_mp3_file()
+                os.close(fd)
+                lang = "zh-cn" if _CJK_RE.search(text) else "en"
+                await asyncio.to_thread(
+                    _GTTS(text=text, lang=lang, tld="com").save, tmp
+                )
+                if os.path.exists(tmp):
+                    with open(tmp, "rb") as f:
+                        data = f.read()
+                    os.unlink(tmp)
+                    return data
+            except Exception as ex:
+                print(f"[TTS] gTTS 合成失败: {ex}")
+        return None
+
+    async def synthesize_concat(self, segments: list, out_path: str) -> Optional[str]:
+        """把多个文本段分别用 Edge TTS 合成，流式拼接写入 out_path（一个完整 mp3）。
+
+        用于"整本连续朗读"：全程只创建一个 AudioPlayer（首段可靠路径），
+        绕开 flet_audio 在安卓上"第二个 player 与原生残留资源冲突 → on_loaded
+        永不触发 → 静音"的坑。返回 out_path；全部合成失败返回 None。
+
+        说明：Edge TTS 同一语音的 MP3 帧参数一致，逐句字节拼接在 ExoPlayer/
+        audioplayers 下可正常连续播放（句边界仅有极轻微静默，语音场景不可闻）。"""
+        ok = False
+        try:
+            with open(out_path, "wb") as f:
+                for seg in segments:
+                    seg = (seg or "").strip()
+                    if not seg:
+                        continue
+                    try:
+                        mp3 = await self._synthesize_bytes(seg)
+                        if mp3:
+                            f.write(mp3)
+                            ok = True
+                    except Exception as ex:
+                        print(f"[TTS] 拼接合成单段失败(跳过): {ex}")
+        except Exception as ex:
+            print(f"[TTS] 写入拼接 mp3 失败: {ex}")
+            return None
+        return out_path if ok else None
+
+    async def _create_and_load(self, mp3_path: str):
+        """创建【单个】flet_audio.Audio（首段可靠路径），等 on_loaded 返回 audio。
+
+        用于"整本连续朗读"：全程只此一个 AudioPlayer，彻底绕开
+        flet_audio 在安卓上"第二个 player 与原生残留资源冲突 → on_loaded 永不触发
+        → 静音"。返回 audio；失败返回 None。"""
+        try:
+            size = os.path.getsize(mp3_path) if os.path.exists(mp3_path) else -1
+        except Exception:
+            size = -1
+        print(f"[TTS] 连续朗读加载: {mp3_path} (size={size})")
+        try:
+            with open(mp3_path, "rb") as f:
+                mp3_bytes = f.read()
+            mp3_b64 = base64.b64encode(mp3_bytes).decode("ascii")
+            print(f"[TTS] 连续朗读 mp3 bytes={len(mp3_bytes)}, base64 长度={len(mp3_b64)}")
+            print(f"[TTS] mp3 前 16 字节 hash: {hash(mp3_bytes[:16])}")
+        except Exception as ex:
+            print(f"[TTS] 读取连续朗读 mp3 失败: {ex}")
+            return None
+
+        loop = asyncio.get_event_loop()
+        loaded_future = loop.create_future()
+
+        def _on_loaded(e):
+            print("[TTS] audio on_loaded 事件触发（连续朗读）")
+            if not loaded_future.done():
+                loaded_future.set_result(True)
+
+        state_log = []
+
+        def _on_state_change(e):
+            try:
+                state = e.data if hasattr(e, "data") else "?"
+            except Exception:
+                state = "?"
+            state_log.append(state)
+
+        audio = self._create_flet_audio(
+            initial_src=mp3_b64,
+            on_loaded=_on_loaded,
+            on_state_change=_on_state_change,
+        )
+        self._audio = audio
+        await asyncio.sleep(0.5)
+        try:
+            audio.update()
+        except Exception as ex:
+            print(f"[TTS] 连续朗读 audio.update() 异常: {ex}")
+        try:
+            await asyncio.wait_for(loaded_future, timeout=15.0)
+            print("[TTS] 连续朗读音频已加载（on_loaded 触发）")
+        except asyncio.TimeoutError:
+            print("[TTS] 警告：连续朗读音频加载超时(15s)，仍尝试播放")
+        return audio
+
+    async def play_continuous_mp3(self, mp3_path: str, duration: float, stop_event):
+        """整本连续朗读：只创建【一个】AudioPlayer（首段可靠路径）播放整段 mp3 一次，
+        彻底绕开 flet_audio 在安卓上"第二个 player 与原生残留资源冲突 → on_loaded
+        永不触发 → 静音"。调用方负责在播放期间用计时驱动高亮；本方法只管
+        "播放到结束或停止信号"。"""
+        if not self._is_mobile():
+            d = duration if duration and duration > 0 else _estimate_duration("")
+            await self._play_pygame(mp3_path, stop_event, d)
+            return
+        await self._dispose_flet_audio()  # 确保开始时干净（首次为 None）
+        audio = await self._create_and_load(mp3_path)
+        if audio is None:
+            print("[TTS] 连续朗读 Audio 创建/加载失败，回退静默计时")
+            await self._wait(duration, stop_event)
+            return
+        try:
+            if stop_event.is_set():
+                return
+            await audio.play()
+            print("[TTS] 连续朗读 audio.play() 已调用（未抛异常）")
+            step = 0.2
+            elapsed = 0.0
+            limit = duration + 3.0  # 给真实播放一点余量，避免提前切断尾音
+            while elapsed < limit and not stop_event.is_set():
+                await asyncio.sleep(step)
+                elapsed += step
+        finally:
+            try:
+                await audio.pause()
+                await audio.release()
+                print("[TTS] 连续朗读结束：已 pause() + release()（全程单个 player）")
+            except Exception:
+                pass
+            self._audio = None
+
     async def speak_file(self, mp3_path: str, stop_event,
                         duration: Optional[float] = None) -> float:
         """直接播放已合成好的 mp3 文件（每段都新建独立 Audio 控件，可靠出声）。

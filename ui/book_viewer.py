@@ -665,7 +665,15 @@ class BookViewer(ft.Container):
         - 逐句高亮等待以"真实音频播完"为准（done_task），估算时长偏长时提前结束，
           消除翻页前的静音停顿。
         """
-        # ---- v1.0.42：每段新建独立 Audio 控件 + ping-pong 双缓冲预取 ----
+        # ---- 移动端：整本连续朗读（v1.0.44）----
+        # flet_audio 在安卓上只有【第一个】AudioPlayer 可靠出声（后续段 / 第二个 player
+        # 因原生 MediaPlayer 资源冲突而 on_loaded 永不触发 → 静音）。根因经 11 个版本
+        # + 日志铁证确认。故移动端改为"整本拼成一个 mp3、单个 player 一次性播完"，
+        # 全程只走那个 100% 可靠的首段播放路径；句子高亮仍用估算时长计时驱动。
+        if self.tts._is_mobile():
+            await self._read_all_mobile_continuous(start_sentence)
+            return
+        # ---- 桌面端：逐段朗读（pygame 无 player 冲突问题）----
         # 每段都走"创建 Audio + 加载"的可靠路径（真机 100% 出声），因此不再有
         # "首段/后续段"之分；ping-pong 仅用于翻页零等待（不等合成）。
         # 不变量：buf[cur_buf] 永远装着"当前段"的音频——
@@ -840,6 +848,120 @@ class BookViewer(ft.Container):
         print(f"[BookViewer] 朗读结束")
 
         # 结束时再保存一次当前位置（兜底；读句中已逐句保存）
+        self._save_position()
+
+    # ==================================================================
+    # 移动端整本连续朗读（v1.0.44）：单个 player 播完整场
+    # ==================================================================
+    def _ensure_page_for_offset(self, global_offset: int):
+        """若 global_offset 不在当前页，翻到对应页（连续朗读用）。"""
+        target = self.current
+        for pi in range(len(self.pages)):
+            nxt = self._page_start_offsets[pi + 1] \
+                if pi + 1 < len(self.pages) else 10 ** 18
+            if self._page_start_offsets[pi] <= global_offset < nxt:
+                target = pi
+                break
+        if target != self.current:
+            self.current = target
+            self._update_page_display()  # 渲染新页（重置 _page_sentences / 清高亮）
+            print(f"[BookViewer] 连续朗读自动翻到第{self.current + 1}页")
+
+    async def _read_all_mobile_continuous(self, start_sentence=0):
+        """移动端整本连续朗读（v1.0.44）：
+
+        把从 start_sentence 句到书末的所有句子拼成一个 mp3，用【单个】AudioPlayer
+        一次性播完（首段可靠路径，100% 出声）。句子高亮用估算时长计时驱动，
+        与音频进度解耦（不依赖 on_loaded 之外的音频事件），并随阅读进度自动翻页。
+
+        这彻底绕开 flet_audio 在安卓上"第二个 player 与原生残留资源冲突 →
+        on_loaded 永不触发 → 静音"的坑——因为全程只有一个 player（首个）。
+        """
+        # 1) 收集剩余句子（文本 + 绝对字符偏移）
+        all_sent = []  # [(text, abs_offset), ...]
+        first_page = True
+        for pi in range(self.current, len(self.pages)):
+            text = self.pages[pi]
+            if not text.strip():
+                continue
+            sents = self._split_into_sentences_with_offsets(text)
+            if not sents:
+                continue
+            sidx = start_sentence if first_page else 0
+            base = self._page_start_offsets[pi]
+            for j in range(sidx, len(sents)):
+                s_text = sents[j][0]
+                if not s_text.strip():
+                    continue
+                all_sent.append((s_text, base + sents[j][1]))
+            first_page = False
+
+        if not all_sent:
+            print("[BookViewer] 无可读句子，停止连续朗读")
+            self._finalize_reading()
+            return
+
+        # 2) 拼成单个 mp3（流式写入，避免整本字节驻留内存）
+        tmp_dir = self.tts._mp3_temp_dir()
+        full_path = os.path.join(tmp_dir, "tmpbookreader_full.mp3")
+        print(f"[BookViewer] 连续朗读：合成 {len(all_sent)} 句为一个 mp3 ...")
+        mp3 = await self.tts.synthesize_concat([s for s, _ in all_sent], full_path)
+        total_dur = sum(estimate_duration(s) for s, _ in all_sent)
+
+        # 3) 启动"单个 player 播完整 mp3"（桌面端回退 pygame）
+        play_task = None
+        if mp3 is not None:
+            play_task = asyncio.create_task(
+                self.tts.play_continuous_mp3(mp3, total_dur, self._tts_stop_event)
+            )
+        else:
+            print("[BookViewer] 连续朗读合成失败，回退纯高亮（无声）")
+
+        # 4) 高亮循环：按估算时长逐句高亮 + 记录位置 + 自动翻页；
+        #    play_task 完成（整本播完）即提前结束等待
+        i = 0
+        while i < len(all_sent) and self._is_reading and not self._tts_stop_event.is_set():
+            s_text, off = all_sent[i]
+            self._save_position(off)
+            self._ensure_page_for_offset(off)
+            idx = self._sentence_index_at_offset(self.current, off)
+            await self._highlight_sentence(idx)
+            await self._wait_for(estimate_duration(s_text), play_task)
+            i += 1
+
+        # 5) 等待播放真正结束（用户中途停止时 play_task 已因 stop_event 退出）
+        if play_task is not None:
+            try:
+                await play_task
+            except Exception as ex:
+                print(f"[BookViewer] 连续朗读播放异常: {ex}")
+
+        # 6) 清理
+        try:
+            if mp3 and os.path.exists(full_path):
+                os.unlink(full_path)
+        except Exception:
+            pass
+        self._finalize_reading()
+        print("[BookViewer] 连续朗读结束")
+
+    async def _finalize_reading(self):
+        """朗读收尾：恢复按钮状态、清高亮、清理计时器、停止播放。"""
+        self._is_reading = False
+        self._tts_stop_event.clear()
+        if self._restart_timer is not None:
+            self._restart_timer.cancel()
+            self._restart_timer = None
+        self._read_task = None
+        self.read_btn.icon = ft.Icons.PLAY_ARROW
+        self.read_btn.tooltip = "朗读全书（点击句子可从该句开始）"
+        # 结束后停止 flet_audio（释放 player）
+        try:
+            self.tts.stop()
+        except Exception:
+            pass
+        await self._clear_highlight()
+        self.ft_page.update()
         self._save_position()
 
     async def _speak_text(self, text: str, prefetched_path=None):
