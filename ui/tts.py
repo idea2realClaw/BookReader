@@ -178,13 +178,13 @@ class TTSEngine:
             pass
 
     async def _stop_flet_audio_async(self, a):
-        # v1.0.40：Audio 对象没有 stop() 方法，用 pause() + release() 停止并重置 player。
+        # v1.0.40：Audio 对象没有 stop() 方法，用 pause() 停止播放。
+        # ⚠️ 绝不能调 release()！release() 会把底层原生 player 释放掉，之后再次
+        # play()（跨会话复用同一控件时）在 Android 上 setSourceBytes 抛异常 /
+        # on_loaded 永不触发 → 第二遍朗读整段静音（v1.0.41 的毒药）。
+        # 停止只 pause()，保持 player 存活；重启时直接换 src + play() 即可。
         try:
             await a.pause()
-        except Exception:
-            pass
-        try:
-            await a.release()
         except Exception:
             pass
 
@@ -764,15 +764,13 @@ class TTSEngine:
             return
 
         # ---- 移动端：单 Audio + COMPLETED 事件链 ----
-        # 跨会话清理（修复"停止后再启动没声音"）：
-        # 上一会话的 Audio 在 stop() 时只被 pause()+release()，
-        # 但仍留在 Flet service registry 中（self._audio 还指着它）。
-        # 本会话若再新建一个 Audio，registry 里就会有两个 AudioPlayer，
-        # Android 上两个 player 抢 MediaPlayer 资源 → 新控件 setSourceBytes
-        # 抛异常 → on_loaded 永不触发 → 静音（即 v1.0.43 的"第二个 player 静音"）。
-        # 修复：启动新会话前，先把残留的旧 Audio 从 registry 真正移除并 dispose，
-        # 保证任意时刻只有一个 Audio 控件被注册。
-        await self._dispose_flet_audio()
+        # 持久单 Audio 控件（v1.1.3 修复"停止后再启动没声音"）：
+        # 整个阅读器生命周期只创建一个 Audio 控件，跨会话【绝不 dispose /
+        # 绝不 release】。停止只 pause()，重启直接复用旧控件换 src + play()。
+        # 根因：Android 上 flet_audio 的 AudioplayersPlugin 是单例，
+        # dispose/recreate 第二个 Audio 后原生侧拿不到干净 player →
+        # on_loaded 永不触发、play() TimeoutException（v1.0.34~v1.0.45 反复踩的坑）。
+        # 而段内本来就是"换 src + play()"且已验证可靠，跨会话复用同一机制即可。
         loop = asyncio.get_event_loop()
         loaded_future = loop.create_future()
         completed_holder = [loop.create_future()]  # 当前段播完置位
@@ -814,15 +812,25 @@ class TTSEngine:
         except Exception:
             pass
 
-        # 创建【单个】Audio（首段可靠路径：src 非空 + on_loaded/on_state 创建时设）
-        audio = self._create_flet_audio(
-            initial_src=b64_0,
-            on_loaded=_on_loaded,
-            on_state_change=_on_state,
-        )
-        self._audio = audio
-        print(f"[TTS] 顺序播放：创建【单】Audio，首段 base64={len(b64_0)} 字符, "
-              f"hash={hash_0}")
+        # 复用持久 Audio 控件：若上一会话已创建且仍挂在页面上，直接复用
+        # （重设回调 + 首段 src，底层 player 始终存活）；否则（首次）创建【单个】Audio。
+        # 两者都不 release / 不 dispose。
+        if self._audio is not None and getattr(self._audio, "page", None) is not None:
+            audio = self._audio
+            audio.on_loaded = _on_loaded
+            audio.on_state_change = _on_state
+            audio.src = b64_0
+            print(f"[TTS] 顺序播放：复用【持久】Audio（id={getattr(audio, '_i', '?')}），"
+                  f"首段 base64={len(b64_0)} 字符, hash={hash_0}")
+        else:
+            audio = self._create_flet_audio(
+                initial_src=b64_0,
+                on_loaded=_on_loaded,
+                on_state_change=_on_state,
+            )
+            self._audio = audio
+            print(f"[TTS] 顺序播放：创建【单】Audio，首段 base64={len(b64_0)} 字符, "
+                  f"hash={hash_0}")
         await asyncio.sleep(0.5)  # 原生注册缓冲
         try:
             audio.update()
