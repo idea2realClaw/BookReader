@@ -59,6 +59,8 @@ class BookViewer(ft.Container):
         self._pending_resume_sentence = None  # 重分页后计算出的"续读句下标"
         self.tts = TTSEngine(self.ft_page)  # 跨平台 TTS 引擎
         self.tts.speed = 1.2  # 默认 1.2 倍速
+        # 音频真正开始播放时隐藏 "Preparing..." 指示
+        self.tts.on_play_start = self._hide_preparing
 
         # 整本文本（用于按窗口动态分页）
         self.full_text = self.reader.get_full_text()
@@ -78,6 +80,16 @@ class BookViewer(ft.Container):
         )
 
         self.page_label = ft.Text(size=12, color=ft.Colors.BLACK54)
+
+        # "Preparing..." 指示：按下播放键后显示（合成/加载音频期间），音频真正
+        # 开始播放后由 TTS 引擎的 on_play_start 回调隐藏（位于阅读区右上角）。
+        self.preparing_text = ft.Text(
+            "Preparing...",
+            size=13,
+            color=ft.Colors.ORANGE_800,
+            weight=ft.FontWeight.W_500,
+            visible=False,
+        )
 
         # 朗读按钮
         self.read_btn = ft.IconButton(
@@ -184,7 +196,10 @@ class BookViewer(ft.Container):
 
         # 阅读区主体：header 在顶部固定，body 为 Stack（文本层 + 浮动的翻页/朗读/倍速栏）
         self.body = ft.Stack(expand=True)
-        self.body.controls = [self.text_container, self.nav_row]
+        # "Preparing..." 指示钉在视图右上角
+        self.preparing_text.top = 8
+        self.preparing_text.right = 12
+        self.body.controls = [self.text_container, self.nav_row, self.preparing_text]
 
         self.content = ft.Column(
             [
@@ -433,6 +448,24 @@ class BookViewer(ft.Container):
         self._render_spans(-1)
         self.ft_page.update()
 
+    def _show_preparing(self):
+        """按下播放键后显示 'Preparing...'（合成/加载音频期间）。"""
+        if not self.preparing_text.visible:
+            self.preparing_text.visible = True
+            try:
+                self.ft_page.update()
+            except Exception:
+                pass
+
+    def _hide_preparing(self):
+        """音频真正开始播放后隐藏 'Preparing...'（回调幂等，重复调用无副作用）。"""
+        if self.preparing_text.visible:
+            self.preparing_text.visible = False
+            try:
+                self.ft_page.update()
+            except Exception:
+                pass
+
     async def _close(self, e):
         """关闭阅读器，保存位置。"""
         if self._is_reading:
@@ -567,6 +600,7 @@ class BookViewer(ft.Container):
         self._is_reading = True
         self.read_btn.icon = ft.Icons.STOP_CIRCLE
         self.read_btn.tooltip = "停止朗读"
+        self._show_preparing()  # 合成/加载音频期间显示 Preparing...
         self.ft_page.update()
         self._read_task = asyncio.create_task(self._read_all(start_sentence=start))
 
@@ -588,6 +622,7 @@ class BookViewer(ft.Container):
         self._is_reading = True
         self.read_btn.icon = ft.Icons.STOP_CIRCLE
         self.read_btn.tooltip = "停止朗读"
+        self._show_preparing()  # 合成/加载音频期间显示 Preparing...
         self.ft_page.update()
         self._read_task = asyncio.create_task(self._read_all(start_sentence=idx))
 
@@ -644,6 +679,7 @@ class BookViewer(ft.Container):
             self._is_reading = True
             self.read_btn.icon = ft.Icons.STOP_CIRCLE
             self.read_btn.tooltip = "停止朗读"
+            self._show_preparing()  # 合成/加载音频期间显示 Preparing...
             self.ft_page.update()
             print(f"[BookViewer] 开始朗读（从第{start + 1}句）")
             self._read_task = asyncio.create_task(self._read_all(start_sentence=start))
@@ -860,6 +896,7 @@ class BookViewer(ft.Container):
         self._read_task = None
         self.read_btn.icon = ft.Icons.PLAY_ARROW
         self.read_btn.tooltip = "朗读全书（点击句子可从该句开始）"
+        self._hide_preparing()  # 朗读结束（无论是否正常出声）隐藏 Preparing...
         await self._clear_highlight()
         self.ft_page.update()
         print(f"[BookViewer] 朗读结束")
@@ -1045,6 +1082,7 @@ class BookViewer(ft.Container):
             self.tts.stop()
         except Exception:
             pass
+        self._hide_preparing()  # 朗读结束（无论是否正常出声）隐藏 Preparing...
         await self._clear_highlight()
         self.ft_page.update()
         self._save_position()

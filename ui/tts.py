@@ -96,6 +96,19 @@ def _rate_string(speed: float) -> str:
     return f"+{pct}%"
 
 
+def _tts_active_marker_path() -> str:
+    """返回"TTS 正在连续朗读"标记文件路径。
+
+    安卓端：Flet 注入的 FLET_APP_STORAGE_DATA（= /data/data/<pkg>/files），
+    等价于原生 MainActivity 的 getFilesDir()；原生层轮询此文件判断是否
+    需要启动 Foreground Service 保活。桌面端回退 ~/.bookreader/。"""
+    for env_key in ("FLET_APP_STORAGE_DATA", "FLET_APP_STORAGE_TEMP"):
+        d = os.getenv(env_key)
+        if d and os.path.isdir(d):
+            return os.path.join(d, ".tts_active")
+    return os.path.join(os.path.expanduser("~"), ".bookreader", ".tts_active")
+
+
 class TTSEngine:
     def __init__(self, page=None):
         self.page = page
@@ -107,6 +120,7 @@ class TTSEngine:
         self._audio = None  # flet_audio.Audio 控件（安卓端应用内播放，懒创建）
         self._audio_just_registered = False  # 首次注册后给原生侧一点准备时间
         self._play_lock = asyncio.Lock()  # 防止并发播放同一 audio 控件
+        self.on_play_start = None  # UI 回调：音频真正开始播放时调用（隐藏"Preparing..."）
         try:
             print(f"[TTS] 初始化：平台={'mobile' if self._is_mobile() else 'desktop'}，"
                   f"flet_audio={'可用' if _FTA is not None else '不可用(将回退系统播放器)'}")
@@ -119,6 +133,20 @@ class TTSEngine:
             return bool(self.page.platform.is_mobile())
         except Exception:
             return False
+
+    def _fire_play_start(self):
+        """音频真正开始播放时触发 on_play_start 回调（UI 用它隐藏"Preparing..."）。
+        回调可能调用 page.update()，由调用方在事件循环中执行，这里用 ensure_future
+        兜底，避免在非事件循环上下文里直接 update 抛异常。幂等：重复调用无害。"""
+        cb = self.on_play_start
+        if cb is None:
+            return
+        try:
+            res = cb()
+            if asyncio.iscoroutine(res):
+                asyncio.ensure_future(res)
+        except Exception as ex:
+            print(f"[TTS] on_play_start 回调异常(非致命): {ex}")
 
     def _voice_id(self, text: str) -> str:
         lang = _detect_lang(text)
@@ -145,6 +173,48 @@ class TTSEngine:
     def _new_mp3_file(self):
         """在合适目录创建唯一 mp3 文件，返回 (fd, path)。移动端落到应用私有临时目录。"""
         return tempfile.mkstemp(suffix=".mp3", dir=self._mp3_temp_dir())
+
+    # ---- 安卓防中断：TTS 活跃标记（驱动原生 Foreground Service）----
+    def _tts_active_marker_path(self) -> str:
+        """返回 TTS 活跃标记文件路径。
+
+        安卓端：Flet 注入的 FLET_APP_STORAGE_DATA（=/data/data/<pkg>/files）
+        与原生 MainActivity.getFilesDir() 完全等价 —— 原生层轮询此文件判断
+        是否需要启动前台服务保活。桌面端回退 ~/.bookreader/。"""
+        if self._is_mobile():
+            for env_key in ("FLET_APP_STORAGE_DATA", "FLET_APP_STORAGE_TEMP"):
+                d = os.getenv(env_key)
+                if d:
+                    try:
+                        os.makedirs(d, exist_ok=True)
+                        if os.path.isdir(d):
+                            return os.path.join(d, ".tts_active")
+                    except Exception:
+                        pass
+        base = os.path.join(os.path.expanduser("~"), ".bookreader")
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(base, ".tts_active")
+
+    def _mark_tts_active(self):
+        """标记 TTS 正在连续朗读（驱动原生 Foreground Service 保活）。"""
+        try:
+            p = self._tts_active_marker_path()
+            with open(p, "w") as f:
+                f.write("1")
+        except Exception as ex:
+            print(f"[TTS] 写活跃标记失败(非致命): {ex}")
+
+    def _clear_tts_active(self):
+        """清除 TTS 活跃标记（原生 Foreground Service 将自动停止）。"""
+        try:
+            p = self._tts_active_marker_path()
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception as ex:
+            print(f"[TTS] 清除活跃标记失败(非致命): {ex}")
 
     # ---- 公开接口 ----
     async def speak(self, text: str, stop_event, prefetched_path: Optional[str] = None) -> float:
@@ -473,6 +543,7 @@ class TTSEngine:
 
         try:
             await audio.play()
+            self._fire_play_start()  # 音频已开始播放 → 隐藏 Preparing...
             print("[TTS] audio.play() 已调用（未抛异常）")
         except Exception as ex:
             print(f"[TTS] flet_audio.play() 抛出异常: {ex}")
@@ -711,6 +782,7 @@ class TTSEngine:
             if stop_event.is_set():
                 return
             await audio.play()
+            self._fire_play_start()  # 音频已开始播放 → 隐藏 Preparing...
             print("[TTS] 连续朗读 audio.play() 已调用（未抛异常）")
             step = 0.2
             elapsed = 0.0
@@ -855,6 +927,7 @@ class TTSEngine:
 
         try:
             await audio.play()
+            self._fire_play_start()  # 音频已开始播放 → 隐藏 Preparing...
             print("[TTS] 顺序播放：audio.play()(段0) 已调用")
         except Exception as ex:
             print(f"[TTS] 段0 audio.play() 异常: {ex}")
@@ -915,6 +988,7 @@ class TTSEngine:
 
             try:
                 await audio.play()
+                self._fire_play_start()  # 音频已开始播放 → 隐藏 Preparing...
                 print(f"[TTS] 顺序播放：audio.play()(段{nxt}) 已调用")
             except Exception as ex:
                 print(f"[TTS] 段{nxt} audio.play() 异常: {ex}")
@@ -1052,6 +1126,7 @@ class TTSEngine:
             try:
                 pygame.mixer.music.load(mp3_path)
                 pygame.mixer.music.play()
+                self._fire_play_start()  # 音频已开始播放 → 隐藏 Preparing...
             except Exception as ex:
                 print(f"[TTS] pygame 播放失败: {ex}")
                 return
