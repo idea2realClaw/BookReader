@@ -54,6 +54,7 @@ class BookViewer(ft.Container):
         self._tts_process = None
         self._read_task = None            # 当前朗读任务（用于点击跳转时等待旧任务结束）
         self._restart_timer = None         # 调速防抖定时器（避免拖动时反复重启朗读）
+        self._read_lock = asyncio.Lock()  # 串行化朗读启停，杜绝并发重入导致双 play_sequential 抢 Audio
         self._last_read_offset = None     # 最近一次朗读到的绝对字符偏移（关闭时回退保存用）
         self._resume_char_offset = None   # 待恢复的字符偏移（__init__ 阶段由 _load_position 写入）
         self._pending_resume_sentence = None  # 重分页后计算出的"续读句下标"
@@ -478,6 +479,13 @@ class BookViewer(ft.Container):
 
         self._save_position()
 
+        # 释放 flet_audio 资源，避免旧 Audio 永久留在 page._services 注册表
+        # （跨书籍累积会干扰后续朗读、甚至导致后续无声）
+        try:
+            await self.tts.dispose()
+        except Exception:
+            pass
+
         if self.on_close:
             await self.on_close()
 
@@ -590,19 +598,20 @@ class BookViewer(ft.Container):
 
     async def _restart_from_current_sentence(self):
         """停止当前朗读，并以最新速度/音色从"当前句"立即重新朗读。"""
-        if not self._is_reading or self._read_task is None:
-            return
-        start = self._current_sentence_idx if self._current_sentence_idx >= 0 else 0
-        # 取消原播放（cancel 比等 stop_event 更可靠，避免旧任务残留）
-        await self._cancel_read_task()
-        # 以新参数从当前句重启
-        self._tts_stop_event.clear()
-        self._is_reading = True
-        self.read_btn.icon = ft.Icons.STOP_CIRCLE
-        self.read_btn.tooltip = "停止朗读"
-        self._show_preparing()  # 合成/加载音频期间显示 Preparing...
-        self.ft_page.update()
-        self._read_task = asyncio.create_task(self._read_all(start_sentence=start))
+        async with self._read_lock:
+            if not self._is_reading or self._read_task is None:
+                return
+            start = self._current_sentence_idx if self._current_sentence_idx >= 0 else 0
+            # 取消原播放（cancel 比等 stop_event 更可靠，避免旧任务残留）
+            await self._cancel_read_task()
+            # 以新参数从当前句重启
+            self._tts_stop_event.clear()
+            self._is_reading = True
+            self.read_btn.icon = ft.Icons.STOP_CIRCLE
+            self.read_btn.tooltip = "停止朗读"
+            self._show_preparing()  # 合成/加载音频期间显示 Preparing...
+            self.ft_page.update()
+            self._read_task = asyncio.create_task(self._read_all(start_sentence=start))
 
     # ------------------------------------------------------------------
     # 点击句子选择朗读起点
@@ -613,18 +622,19 @@ class BookViewer(ft.Container):
 
     async def _start_reading_from(self, idx: int):
         """停止当前朗读（若有），并从指定句子开始朗读。"""
-        if self._is_reading:
-            self._tts_stop_event.set()
-        # 不论是否正在朗读，先彻底取消旧任务，避免两个朗读循环重叠
-        await self._cancel_read_task()
-        # 进入朗读状态，从该句开始
-        self._tts_stop_event.clear()
-        self._is_reading = True
-        self.read_btn.icon = ft.Icons.STOP_CIRCLE
-        self.read_btn.tooltip = "停止朗读"
-        self._show_preparing()  # 合成/加载音频期间显示 Preparing...
-        self.ft_page.update()
-        self._read_task = asyncio.create_task(self._read_all(start_sentence=idx))
+        async with self._read_lock:
+            if self._is_reading:
+                self._tts_stop_event.set()
+            # 不论是否正在朗读，先彻底取消旧任务，避免两个朗读循环重叠
+            await self._cancel_read_task()
+            # 进入朗读状态，从该句开始
+            self._tts_stop_event.clear()
+            self._is_reading = True
+            self.read_btn.icon = ft.Icons.STOP_CIRCLE
+            self.read_btn.tooltip = "停止朗读"
+            self._show_preparing()  # 合成/加载音频期间显示 Preparing...
+            self.ft_page.update()
+            self._read_task = asyncio.create_task(self._read_all(start_sentence=idx))
 
     async def _cancel_read_task(self, timeout: float = 2.0):
         """彻底取消并等待旧的朗读协程结束，保证任意时刻只有一个朗读任务。
@@ -651,38 +661,40 @@ class BookViewer(ft.Container):
             self._read_task = None
 
     async def _toggle_read(self, e):
-        """切换朗读状态。
+        """切换朗读状态。串行化以杜绝并发重入（按钮双击 / 句子点击并发会
+        导致两个 _read_all 协程同时跑、抢同一个 flet_audio.Audio 控件）。
 
         未朗读时按"朗读全书"：从当前页第一句开始朗读。
         朗读中按停止：停止朗读。
         （点击任意句子则直接从该句开始，见 _start_reading_from）
         """
-        if self._is_reading:
-            # 停止朗读
-            self._tts_stop_event.set()
-            self._is_reading = False
-            if self._restart_timer is not None:
-                self._restart_timer.cancel()
-                self._restart_timer = None
-            # 先彻底取消旧朗读协程，避免停止后仍残留后台任务
-            await self._cancel_read_task()
-            # 复用收尾逻辑：清高亮 / 停播放 / 复位按钮
-            await self._finalize_reading()
-            print(f"[BookViewer] 停止朗读")
-        else:
-            # 开始朗读：先确保没有残留的朗读协程（停止→再启动必须干净），
-            # 否则旧任务会被新会话 clear 的 stop_event"复活"而并发抢 Audio。
-            await self._cancel_read_task()
-            # 优先从已恢复/已点击的句开始（否则当前页第一句）
-            start = self._current_sentence_idx if self._current_sentence_idx >= 0 else 0
-            self._tts_stop_event.clear()
-            self._is_reading = True
-            self.read_btn.icon = ft.Icons.STOP_CIRCLE
-            self.read_btn.tooltip = "停止朗读"
-            self._show_preparing()  # 合成/加载音频期间显示 Preparing...
-            self.ft_page.update()
-            print(f"[BookViewer] 开始朗读（从第{start + 1}句）")
-            self._read_task = asyncio.create_task(self._read_all(start_sentence=start))
+        async with self._read_lock:
+            if self._is_reading:
+                # 停止朗读
+                self._tts_stop_event.set()
+                self._is_reading = False
+                if self._restart_timer is not None:
+                    self._restart_timer.cancel()
+                    self._restart_timer = None
+                # 先彻底取消旧朗读协程，避免停止后仍残留后台任务
+                await self._cancel_read_task()
+                # 复用收尾逻辑：清高亮 / 停播放 / 复位按钮
+                await self._finalize_reading()
+                print(f"[BookViewer] 停止朗读")
+            else:
+                # 开始朗读：先确保没有残留的朗读协程（停止→再启动必须干净），
+                # 否则旧任务会被新会话 clear 的 stop_event"复活"而并发抢 Audio。
+                await self._cancel_read_task()
+                # 优先从已恢复/已点击的句开始（否则当前页第一句）
+                start = self._current_sentence_idx if self._current_sentence_idx >= 0 else 0
+                self._tts_stop_event.clear()
+                self._is_reading = True
+                self.read_btn.icon = ft.Icons.STOP_CIRCLE
+                self.read_btn.tooltip = "停止朗读"
+                self._show_preparing()  # 合成/加载音频期间显示 Preparing...
+                self.ft_page.update()
+                print(f"[BookViewer] 开始朗读（从第{start + 1}句）")
+                self._read_task = asyncio.create_task(self._read_all(start_sentence=start))
 
     async def _apply_resume_highlight(self):
         """打开书籍后：若存在续读位置，把光标定位到该句并高亮，但不自动朗读。

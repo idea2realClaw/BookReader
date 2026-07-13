@@ -120,6 +120,7 @@ class TTSEngine:
         self._audio = None  # flet_audio.Audio 控件（安卓端应用内播放，懒创建）
         self._audio_just_registered = False  # 首次注册后给原生侧一点准备时间
         self._play_lock = asyncio.Lock()  # 防止并发播放同一 audio 控件
+        self._sequential_active = False   # 顺序朗读并发重入守卫（防双 play_sequential 抢 Audio）
         self.on_play_start = None  # UI 回调：音频真正开始播放时调用（隐藏"Preparing..."）
         try:
             print(f"[TTS] 初始化：平台={'mobile' if self._is_mobile() else 'desktop'}，"
@@ -340,6 +341,18 @@ class TTSEngine:
                 pass
         except Exception as ex:
             print(f"[TTS] dispose 移除 registry 失败(非致命): {ex}")
+
+    async def dispose(self):
+        """阅读器关闭时调用：彻底释放 flet_audio 资源。
+
+        每个 BookViewer 各自持有一个 TTSEngine 与独立 Audio 控件；若关闭阅读器
+        时不释放，旧 Audio 会永久留在 page._services 注册表里（registry size
+        3→5→… 累积），后续书籍打开越多越可能干扰原生 audioplayers、拖慢甚至
+        导致后续朗读无声。这里复用已验证干净的 _dispose_flet_audio()。"""
+        try:
+            await self._dispose_flet_audio()
+        except Exception as ex:
+            print(f"[TTS] dispose 异常(非致命): {ex}")
 
     def _get_flet_audio(self, initial_src=None, on_loaded=None, on_state_change=None):
         """懒创建并注册一个 flet_audio.Audio 控件（应用内播放，原生支持 Android）。
@@ -805,6 +818,23 @@ class TTSEngine:
     # （用 COMPLETED 链驱动）。边播边转，零整本预处理延迟。
     # ==================================================================
     async def play_sequential(self, segments, stop_event, on_seg_start=None):
+        """并发重入守卫：同一引擎只允许一个顺序朗读会话。
+        防止两个协程（按钮双击 / 句子点击并发 / 调速重启竞态）同时进入、
+        抢同一个 flet_audio.Audio 控件 → 互设 src、重复 play()、最终
+        'inexistent control' 整段静音（已在日志复现：同一秒两次
+        '顺序朗读：共 N 句'）。内层实现见 _play_sequential_inner。"""
+        if not segments:
+            return
+        if self._sequential_active:
+            print("[TTS] 顺序播放：已有会话运行，忽略重复调用（防并发抢 Audio）")
+            return
+        self._sequential_active = True
+        try:
+            await self._play_sequential_inner(segments, stop_event, on_seg_start)
+        finally:
+            self._sequential_active = False
+
+    async def _play_sequential_inner(self, segments, stop_event, on_seg_start=None):
         """单 flet_audio.Audio 控件 + COMPLETED 事件链驱动顺序播放。
 
         架构（师父指定）：
@@ -884,25 +914,22 @@ class TTSEngine:
         except Exception:
             pass
 
-        # 复用持久 Audio 控件：若上一会话已创建且仍挂在页面上，直接复用
-        # （重设回调 + 首段 src，底层 player 始终存活）；否则（首次）创建【单个】Audio。
-        # 两者都不 release / 不 dispose。
-        if self._audio is not None and getattr(self._audio, "page", None) is not None:
-            audio = self._audio
-            audio.on_loaded = _on_loaded
-            audio.on_state_change = _on_state
-            audio.src = b64_0
-            print(f"[TTS] 顺序播放：复用【持久】Audio（id={getattr(audio, '_i', '?')}），"
-                  f"首段 base64={len(b64_0)} 字符, hash={hash_0}")
-        else:
-            audio = self._create_flet_audio(
-                initial_src=b64_0,
-                on_loaded=_on_loaded,
-                on_state_change=_on_state,
-            )
-            self._audio = audio
-            print(f"[TTS] 顺序播放：创建【单】Audio，首段 base64={len(b64_0)} 字符, "
-                  f"hash={hash_0}")
+        # 每次朗读会话都创建【全新】Audio 控件，先释放上一会话残留的旧控件。
+        # 根因：v1.0.42 发现复用旧控件仅换 src 时，真机第 2 段起 on_loaded 永不触发；
+        # 而"停顿后再启动"复用旧控件，首段 on_loaded 也常不触发（日志见 8s 超时），
+        # 且并发双调用会两个协程抢同一控件 → 'inexistent control' 整段静音。
+        # 改为：会话开始先 _dispose_flet_audio() 干净释放旧 player（v1.0.43 已从
+        # registry 移除旧控件 → dart 端 player.dispose() 彻底释放），再创建全新控件，
+        # 首段 on_loaded 稳定 <1s 触发（已验证），彻底消除重启 8s 超时与并发踩踏。
+        await self._dispose_flet_audio()
+        audio = self._create_flet_audio(
+            initial_src=b64_0,
+            on_loaded=_on_loaded,
+            on_state_change=_on_state,
+        )
+        self._audio = audio
+        print(f"[TTS] 顺序播放：创建【单】Audio，首段 base64={len(b64_0)} 字符, "
+              f"hash={hash_0}")
         await asyncio.sleep(0.5)  # 原生注册缓冲
         try:
             audio.update()
