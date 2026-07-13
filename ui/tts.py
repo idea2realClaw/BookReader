@@ -121,6 +121,7 @@ class TTSEngine:
         self._audio_just_registered = False  # 首次注册后给原生侧一点准备时间
         self._play_lock = asyncio.Lock()  # 防止并发播放同一 audio 控件
         self._sequential_active = False   # 顺序朗读并发重入守卫（防双 play_sequential 抢 Audio）
+        self._stop_task = None         # 遗留的异步 stop(pause) 任务（快速停止→再启动时需取消）
         self.on_play_start = None  # UI 回调：音频真正开始播放时调用（隐藏"Preparing..."）
         try:
             print(f"[TTS] 初始化：平台={'mobile' if self._is_mobile() else 'desktop'}，"
@@ -244,7 +245,10 @@ class TTSEngine:
             return
         try:
             loop = asyncio.get_event_loop()
-            loop.create_task(self._stop_flet_audio_async(a))
+            # 记录任务句柄，供下次 play_sequential 启动时取消（避免快速
+            # 停止→再启动后，上一次 stop 的 pause 才异步执行、把刚复用的
+            # Audio 切断）。
+            self._stop_task = loop.create_task(self._stop_flet_audio_async(a))
         except Exception:
             pass
 
@@ -865,6 +869,16 @@ class TTSEngine:
                 await self._speak_edge(s, stop_event)
             return
 
+        # 取消上一次 stop() 遗留的异步 pause 任务（若存在）。
+        # 否则"快速停止→再启动"时，旧 pause 可能在刚复用的 Audio 开始
+        # 播放后才异步执行，把声音切断（二次竞态）。
+        if self._stop_task is not None and not self._stop_task.done():
+            try:
+                self._stop_task.cancel()
+            except Exception:
+                pass
+        self._stop_task = None
+
         # ---- 移动端：单 Audio + COMPLETED 事件链 ----
         # 持久单 Audio 控件（v1.1.3 修复"停止后再启动没声音"）：
         # 整个阅读器生命周期只创建一个 Audio 控件，跨会话【绝不 dispose /
@@ -914,22 +928,37 @@ class TTSEngine:
         except Exception:
             pass
 
-        # 每次朗读会话都创建【全新】Audio 控件，先释放上一会话残留的旧控件。
-        # 根因：v1.0.42 发现复用旧控件仅换 src 时，真机第 2 段起 on_loaded 永不触发；
-        # 而"停顿后再启动"复用旧控件，首段 on_loaded 也常不触发（日志见 8s 超时），
-        # 且并发双调用会两个协程抢同一控件 → 'inexistent control' 整段静音。
-        # 改为：会话开始先 _dispose_flet_audio() 干净释放旧 player（v1.0.43 已从
-        # registry 移除旧控件 → dart 端 player.dispose() 彻底释放），再创建全新控件，
-        # 首段 on_loaded 稳定 <1s 触发（已验证），彻底消除重启 8s 超时与并发踩踏。
-        await self._dispose_flet_audio()
-        audio = self._create_flet_audio(
-            initial_src=b64_0,
-            on_loaded=_on_loaded,
-            on_state_change=_on_state,
-        )
-        self._audio = audio
-        print(f"[TTS] 顺序播放：创建【单】Audio，首段 base64={len(b64_0)} 字符, "
-              f"hash={hash_0}")
+        # 持久单 Audio 控件（v1.1.3 终极修复"停止后再启动没声音"）：
+        # 整个阅读器生命周期只创建一个 Audio 控件，跨会话【绝不 dispose / 绝不 recreate】。
+        # 停止只 pause()，重启直接复用旧控件、换 seg0 的 src + play()。
+        # 根因（用户日志实锤）：Android 上 flet_audio 的 AudioplayersPlugin 是单例，
+        # dispose/recreate 第二个 Audio 后原生侧拿不到干净 player → on_loaded 永不触发、
+        # play() 报 'inexistent control: 112'，首段 8s 加载超时。第一遍永远好使、
+        # 第二遍必死，正是此坑。复用同一套"换 src + play()"机制即可（段内已验证可靠）。
+        if self._audio is not None and getattr(self._audio, "page", None) is not None:
+            # 复用持久 Audio：先停掉可能残留的播放，再重设回调指向本会话的
+            # future，最后换 seg0 的 src（底层 player 始终存活，不会触发 recreate 坑）。
+            audio = self._audio
+            try:
+                await audio.pause()
+            except Exception:
+                pass
+            audio.on_loaded = _on_loaded
+            audio.on_state_change = _on_state
+            audio.src = b64_0
+            print(f"[TTS] 顺序播放：复用【持久】Audio（id={getattr(audio, '_i', '?')}），"
+                  f"首段 base64={len(b64_0)} 字符, hash={hash_0}")
+        else:
+            # 首次（或 reader 关闭后重开）：创建【单个】Audio，此后整个生命周期
+            # 不再 recreate（主动 recycle 只在 TTSEngine.dispose / 关闭阅读器时发生）。
+            audio = self._create_flet_audio(
+                initial_src=b64_0,
+                on_loaded=_on_loaded,
+                on_state_change=_on_state,
+            )
+            self._audio = audio
+            print(f"[TTS] 顺序播放：创建【单】Audio，首段 base64={len(b64_0)} 字符, "
+                  f"hash={hash_0}")
         await asyncio.sleep(0.5)  # 原生注册缓冲
         try:
             audio.update()
