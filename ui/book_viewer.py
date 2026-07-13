@@ -727,25 +727,22 @@ class BookViewer(ft.Container):
             await self._read_all_mobile_sequential(start_sentence)
             return
         # ---- 桌面端：逐段朗读（pygame 无 player 冲突问题）----
-        # 每段都走"创建 Audio + 加载"的可靠路径（真机 100% 出声），因此不再有
-        # "首段/后续段"之分；ping-pong 仅用于翻页零等待（不等合成）。
-        # 不变量：buf[cur_buf] 永远装着"当前段"的音频——
-        #   首段预合成到 buf[0]；后续段由上一段的并行任务合成到 buf[1-cur_buf]。
-        tmp_dir = self.tts._mp3_temp_dir()
-        buf_paths = [
-            os.path.join(tmp_dir, "tmpbookreader1.mp3"),
-            os.path.join(tmp_dir, "tmpbookreader2.mp3"),
-        ]
+        # 每段（每页）合成到【唯一】临时 mp3 文件，播放后删除；下一段在播放当前段时
+        # 并行预合成（同样是唯一路径），翻页零等待。
+        # 不用固定文件名 ping-pong：Windows 下若上一次朗读遗留的并行合成任务（或
+        # 停止后再启动的新任务）还在写同一个 tmpbookreader1/2.mp3，会 Permission denied
+        # → 该段合成失败 → mp3=None → 整段静音被"跳过"，表现就是"某句/某段丢失"。
         first_page = True
-        cur_buf = 0           # 当前段音频所在缓冲下标
-        pending = None         # 下一段的并行合成任务
+        cur_mp3 = None          # 当前段已合成好的 mp3 路径（唯一临时文件）
+        mp3 = None              # 当前正在播放的临时文件（收尾清理用）
+        pending = None          # 下一段的并行合成任务（返回唯一路径）
 
-        # 预合成首段（含可能的 resume 起始句）到 buf[0]
+        # 预合成首段（含可能的 resume 起始句）到唯一临时文件
         text0 = self.pages[self.current]
         sentences0 = self._split_into_sentences_with_offsets(text0)
         start_idx0 = start_sentence if first_page else 0
         seg0 = text0[sentences0[start_idx0][1]:] if start_idx0 > 0 else text0
-        await self.tts.synthesize_to_path_named(seg0, buf_paths[0])
+        cur_mp3 = await self.tts.synthesize_to_path(seg0)
 
         while self._is_reading and not self._tts_stop_event.is_set():
             try:
@@ -784,35 +781,42 @@ class BookViewer(ft.Container):
 
                 durations = [estimate_duration(s) for s, _ in sentences]
 
-                # 当前段音频在 buf[cur_buf]（首段预合成 / 上一段并行合成好）
-                mp3 = buf_paths[cur_buf]
-                if not os.path.exists(mp3):
-                    # 预取失败兜底：现场合成到当前缓冲
-                    mp3 = await self.tts.synthesize_to_path_named(speak_text, buf_paths[cur_buf])
+                # 当前段音频：首段预合成 / 上一段并行预合成好；都没有则现场合成
+                mp3 = cur_mp3
+                cur_mp3 = None
+                if mp3 is None or not os.path.exists(mp3):
+                    mp3 = await self.tts.synthesize_to_path(speak_text)
                     if mp3 is None:
-                        await self._wait(sum(durations) if durations else 0.0, self._tts_stop_event)
+                        # 合成彻底失败：按节奏静默停顿，但【不丢句子】
+                        # （高亮/位置照常记录，仅无声音，避免整段被跳过）
+                        for i in range(start_idx, len(sentences)):
+                            if self._tts_stop_event.is_set():
+                                break
+                            await self._highlight_sentence(i)
+                            self._save_position(page_char_offset + sentences[i][1])
+                            await self._wait_for(durations[i])
                         if self._tts_stop_event.is_set():
                             break
                         if self.current < len(self.pages) - 1:
                             self.current += 1
+                            await self._clear_highlight()
                             self._update_page_display()
                         else:
                             break
                         continue
 
-                # 并行合成"下一段"到另一缓冲（翻页零等待；通常播放期间已完成）
-                other = 1 - cur_buf
+                # 并行预合成"下一段"到唯一临时文件（翻页零等待；播放期间通常已完成）
                 nxt = self.current + 1
                 if nxt < len(self.pages):
                     pending = asyncio.create_task(
-                        self.tts.synthesize_to_path_named(self.pages[nxt], buf_paths[other])
+                        self.tts.synthesize_to_path(self.pages[nxt])
                     )
                 else:
                     pending = None
 
-                # 完整播放当前段 mp3（每段新建独立 Audio，可靠出声）
+                # 完整播放当前段 mp3（整页一个 mp3）；估算总时长作为 pygame 等待下界
                 speak_task = asyncio.create_task(
-                    self._speak_text_from_file(speak_text, mp3)
+                    self._speak_text_from_file(speak_text, mp3, sum(durations))
                 )
 
                 # 逐句高亮 + 记录位置，与朗读节奏同步；整页播完则提前结束等待
@@ -831,27 +835,25 @@ class BookViewer(ft.Container):
                 except Exception as ex:
                     print(f"[BookViewer] 朗读任务异常: {ex}")
 
-                # 等待下一段并行合成完成（通常已完成）
+                # 等待下一段并行合成完成（通常已完成），结果作为下一段的当前音频
                 if pending is not None:
                     try:
-                        res = await pending
-                        if res is None:
-                            print("[BookViewer] 下一段合成失败")
+                        cur_mp3 = await pending
                     except Exception as ex:
                         print(f"[BookViewer] 并行合成异常: {ex}")
+                        cur_mp3 = None
                     pending = None
 
                 if self._tts_stop_event.is_set():
                     break
 
-                # 删除"已播放"的当前缓冲，并切换到下一段已合成好的另一缓冲
+                # 删除"已播放"的当前段临时文件（pygame 已播完，文件句柄已释放，安全删除）
                 try:
-                    if os.path.exists(buf_paths[cur_buf]):
-                        os.unlink(buf_paths[cur_buf])
-                        print(f"[BookViewer] 已删除旧缓冲 tmpbookreader{cur_buf + 1}.mp3")
+                    if mp3 and os.path.exists(mp3):
+                        os.unlink(mp3)
+                        print(f"[BookViewer] 已删除已播放临时文件")
                 except Exception:
                     pass
-                cur_buf = 1 - cur_buf
 
                 # 自动翻页
                 if self.current < len(self.pages) - 1:
@@ -869,7 +871,7 @@ class BookViewer(ft.Container):
                 traceback.print_exc()
                 break
 
-        # 清理：取消未完成的并行合成 + 删除 ping-pong 双缓冲文件
+        # 清理：取消未完成的并行合成 + 删除已合成但未删的临时文件
         if pending is not None:
             if not pending.done():
                 pending.cancel()
@@ -880,12 +882,14 @@ class BookViewer(ft.Container):
                         os.unlink(p)
                 except Exception:
                     pass
-        for bp in buf_paths:
+            pending = None
+        for leftover in (mp3, cur_mp3):
             try:
-                if os.path.exists(bp):
-                    os.unlink(bp)
+                if leftover and os.path.exists(leftover):
+                    os.unlink(leftover)
             except Exception:
                 pass
+        cur_mp3 = None
 
         # 朗读结束，恢复按钮状态
         self._is_reading = False
@@ -1024,8 +1028,10 @@ class BookViewer(ft.Container):
             return
 
         # 2) 拼成单个 mp3（流式写入，避免整本字节驻留内存）
-        tmp_dir = self.tts._mp3_temp_dir()
-        full_path = os.path.join(tmp_dir, "tmpbookreader_full.mp3")
+        #    用唯一临时文件名，避免停止后再启动的新任务并发写同一固定文件
+        #    （Permission denied → 合成失败 → 整本静音被跳过）。
+        fd, full_path = self.tts._new_mp3_file()
+        os.close(fd)
         print(f"[BookViewer] 连续朗读：合成 {len(all_sent)} 句为一个 mp3 ...")
         mp3 = await self.tts.synthesize_concat([s for s, _ in all_sent], full_path)
         total_dur = sum(estimate_duration(s) for s, _ in all_sent)
@@ -1100,14 +1106,21 @@ class BookViewer(ft.Container):
             import traceback
             traceback.print_exc()
 
-    async def _speak_text_from_file(self, text: str, mp3_path):
-        """用跨平台 TTS 播放已合成好的 mp3 文件（每段都走"新建 Audio"的可靠路径）。"""
+    async def _speak_text_from_file(self, text: str, mp3_path, duration: float = 0.0):
+        """用跨平台 TTS 播放已合成好的 mp3 文件（每段都走"新建 Audio"的可靠路径）。
+
+        duration：该段估算总时长（秒），作为 pygame 等待下界，避免提前切断尾音
+        （同时也防止 pygame.mixer.music.get_busy() 在 play() 后的瞬间误判为已结束）。
+        """
         if not text.strip():
             return
 
         print(f"[BookViewer] TTS朗读(段): {len(text)} 字符")
         try:
-            await self.tts.speak_file(mp3_path, self._tts_stop_event)
+            await self.tts.speak_file(
+                mp3_path, self._tts_stop_event,
+                duration if duration and duration > 0 else None,
+            )
         except Exception as ex:
             print(f"[BookViewer] TTS错误: {ex}")
             import traceback
