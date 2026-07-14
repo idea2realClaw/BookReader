@@ -888,7 +888,8 @@ class TTSEngine:
         # on_loaded 永不触发、play() TimeoutException（v1.0.34~v1.0.45 反复踩的坑）。
         # 而段内本来就是"换 src + play()"且已验证可靠，跨会话复用同一机制即可。
         loop = asyncio.get_event_loop()
-        loaded_future = loop.create_future()
+        # 用可变容器持有 future，便于回收重建时整体替换
+        loaded_holder = [loop.create_future()]
         completed_holder = [loop.create_future()]  # 当前段播完置位
 
         def _b64_of(p):
@@ -898,8 +899,8 @@ class TTSEngine:
 
         def _on_loaded(e):
             print("[TTS] audio on_loaded 触发（顺序播放）")
-            if not loaded_future.done():
-                loaded_future.set_result(True)
+            if not loaded_holder[0].done():
+                loaded_holder[0].set_result(True)
 
         def _on_state(e):
             st = getattr(e, "state", None)
@@ -913,7 +914,7 @@ class TTSEngine:
                 if not completed_holder[0].done():
                     completed_holder[0].set_result(True)
 
-        # 先合成第 0 段（创建 Audio 必须非空 src）
+        # 先合成第 0 段（创建/换源必须非空 src）
         mp3_0 = await self._synthesize_mobile_to_file(segments[0])
         if mp3_0 is None:
             print("[TTS] 顺序播放：首段合成失败，回退静默计时")
@@ -928,65 +929,87 @@ class TTSEngine:
         except Exception:
             pass
 
-        # 持久单 Audio 控件（v1.1.3 终极修复"停止后再启动没声音"）：
+        # 持久单 Audio 控件（v1.1.3 修复"停止后再启动没声音"）：
         # 整个阅读器生命周期只创建一个 Audio 控件，跨会话【绝不 dispose / 绝不 recreate】。
-        # 停止只 pause()，重启直接复用旧控件、换 seg0 的 src + play()。
-        # 根因（用户日志实锤）：Android 上 flet_audio 的 AudioplayersPlugin 是单例，
-        # dispose/recreate 第二个 Audio 后原生侧拿不到干净 player → on_loaded 永不触发、
-        # play() 报 'inexistent control: 112'，首段 8s 加载超时。第一遍永远好使、
-        # 第二遍必死，正是此坑。复用同一套"换 src + play()"机制即可（段内已验证可靠）。
-        if self._audio is not None and getattr(self._audio, "page", None) is not None:
-            # 复用持久 Audio：先停掉可能残留的播放，再重设回调指向本会话的
-            # future，最后换 seg0 的 src（底层 player 始终存活，不会触发 recreate 坑）。
-            audio = self._audio
-            try:
-                await audio.pause()
-            except Exception:
-                pass
-            audio.on_loaded = _on_loaded
-            audio.on_state_change = _on_state
-            audio.src = b64_0
-            print(f"[TTS] 顺序播放：复用【持久】Audio（id={getattr(audio, '_i', '?')}），"
-                  f"首段 base64={len(b64_0)} 字符, hash={hash_0}")
-        else:
-            # 首次（或 reader 关闭后重开）：创建【单个】Audio，此后整个生命周期
-            # 不再 recreate（主动 recycle 只在 TTSEngine.dispose / 关闭阅读器时发生）。
-            audio = self._create_flet_audio(
+        # 停止只 pause()，重启直接复用旧控件换 src + play()。
+        # ⚠️ 但 App 长时间后台/空闲时，Android 会回收底层 MediaPlayer；
+        # 复用已失效的控件 → on_loaded 永不触发、play() 卡 30s 超时
+        # （v1.1.7 真机：停止 6.5h 后再读，复用 id=91 却首段 8s 超时 + play() 抛
+        # TimeoutException）。故增加【回收重建兜底】：首段 on_loaded 超时 或 play()
+        # 抛 TimeoutException 时，干净 dispose 失效控件 → 重建全新 Audio → 重试一次。
+        # 仍失败则明确报错、避免 30s 静默卡死（用户重启应用即可恢复首段可用）。
+        async def _acquire():
+            """取得首段要用的 Audio 控件：优先复用持久控件，否则新建。"""
+            if self._audio is not None and getattr(self._audio, "page", None) is not None:
+                a = self._audio
+                try:
+                    await a.pause()
+                except Exception:
+                    pass
+                a.on_loaded = _on_loaded
+                a.on_state_change = _on_state
+                print(f"[TTS] 顺序播放：复用【持久】Audio（id={getattr(a, '_i', '?')}），"
+                      f"首段 base64={len(b64_0)} 字符, hash={hash_0}")
+                return a
+            a = self._create_flet_audio(
                 initial_src=b64_0,
                 on_loaded=_on_loaded,
                 on_state_change=_on_state,
             )
-            self._audio = audio
-            print(f"[TTS] 顺序播放：创建【单】Audio，首段 base64={len(b64_0)} 字符, "
-                  f"hash={hash_0}")
-        await asyncio.sleep(0.5)  # 原生注册缓冲
-        try:
-            audio.update()
-        except Exception as ex:
-            print(f"[TTS] audio.update() 异常: {ex}")
+            self._audio = a
+            print(f"[TTS] 顺序播放：创建【单】Audio，首段 base64={len(b64_0)} 字符, hash={hash_0}")
+            return a
 
-        # 等首段加载（最多 8s；即使 on_loaded 没到也尝试播）
-        try:
-            await asyncio.wait_for(loaded_future, timeout=8.0)
-            print("[TTS] 顺序播放：首段已加载")
-        except asyncio.TimeoutError:
-            print("[TTS] 警告：首段加载超时(8s)，仍尝试播放")
-
-        if stop_event.is_set():
-            return
-
-        if on_seg_start is not None:
+        audio = await _acquire()
+        first_ok = False
+        for _attempt in range(2):  # 0=初次（复用/新建）；1=回收重建兜底
             try:
-                on_seg_start(0, segments[0])
+                audio.src = b64_0
+                await asyncio.sleep(0.5)  # 原生注册缓冲
+                try:
+                    audio.update()
+                except Exception as ex:
+                    print(f"[TTS] audio.update() 异常: {ex}")
+                # 等首段加载（最多 8s；即使 on_loaded 没到也尝试播）
+                try:
+                    await asyncio.wait_for(loaded_holder[0], timeout=8.0)
+                    print("[TTS] 顺序播放：首段已加载")
+                except asyncio.TimeoutError:
+                    print("[TTS] 警告：首段加载超时(8s)，仍尝试播放")
+                if stop_event.is_set():
+                    return
+                if on_seg_start is not None:
+                    try:
+                        on_seg_start(0, segments[0])
+                    except Exception as ex:
+                        print(f"[BookViewer] on_seg_start 回调异常(非致命): {ex}")
+                # 用 wait_for 包裹 play()，避免底层 player 失效时卡满 30s 默认超时
+                try:
+                    await asyncio.wait_for(audio.play(), timeout=12.0)
+                    self._fire_play_start()  # 音频已开始播放 → 隐藏 Preparing...
+                    print("[TTS] 顺序播放：audio.play()(段0) 已调用")
+                    first_ok = True
+                    break
+                except asyncio.TimeoutError:
+                    print("[TTS] 段0 audio.play() 超时(12s)：底层 player 可能已失效")
+                except Exception as ex:
+                    print(f"[TTS] 段0 audio.play() 异常: {ex}")
             except Exception as ex:
-                print(f"[BookViewer] on_seg_start 回调异常(非致命): {ex}")
+                print(f"[TTS] 段0 准备异常: {ex}")
 
-        try:
-            await audio.play()
-            self._fire_play_start()  # 音频已开始播放 → 隐藏 Preparing...
-            print("[TTS] 顺序播放：audio.play()(段0) 已调用")
-        except Exception as ex:
-            print(f"[TTS] 段0 audio.play() 异常: {ex}")
+            if _attempt == 0:
+                # —— 回收重建兜底：App 长时间后台被系统回收 MediaPlayer 后，
+                # 复用原控件会 on_loaded 不触发 / play() 卡死。干净 dispose 失效控件，
+                # 重建全新 Audio（旧 player 已被系统回收、无残留冲突）再试一次。
+                print("[TTS] 回收失效 Audio 控件，重建全新控件重试一次...")
+                await self._dispose_flet_audio()
+                loaded_holder[0] = loop.create_future()
+                audio = await _acquire()  # 持久控件刚被 dispose → 走新建分支
+            else:
+                print("[TTS] ⚠️ 回收重建后仍无法播放，放弃本次朗读（请重启应用后重试）")
+                return
+
+        if not first_ok:
             return
 
         # 预合成第 1 段（段0 播放期间并行，消除段间间隙）
@@ -1043,9 +1066,14 @@ class TTSEngine:
                     print(f"[BookViewer] on_seg_start 回调异常(非致命): {ex}")
 
             try:
-                await audio.play()
+                await asyncio.wait_for(audio.play(), timeout=12.0)
                 self._fire_play_start()  # 音频已开始播放 → 隐藏 Preparing...
                 print(f"[TTS] 顺序播放：audio.play()(段{nxt}) 已调用")
+            except asyncio.TimeoutError:
+                # 段内 player 失效（如中途被系统回收）：快速失败，避免卡 30s。
+                # 用户从当前句重新点读即触发首段【回收重建】兜底恢复。
+                print(f"[TTS] 段{nxt} audio.play() 超时(12s)，停止朗读")
+                break
             except Exception as ex:
                 print(f"[TTS] 段{nxt} audio.play() 异常: {ex}")
                 break
