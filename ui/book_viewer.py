@@ -223,6 +223,17 @@ class BookViewer(ft.Container):
         if self._pending_resume_sentence is not None and self._pending_resume_sentence >= 0:
             asyncio.create_task(self._apply_resume_highlight())
 
+        # 监听安卓 app 生命周期（锁屏 paused / 解锁 resumed）：
+        # 修复"锁屏回来翻页/回退键没反应"——解锁后强制重渲 UI，并对卡死的
+        # 朗读状态机做复位兜底。仅移动端需要（桌面端 pygame 路径无此脱节问题）。
+        self._stop_on_lock = True   # False=锁屏继续朗读（需配套原生前台服务/唤醒锁）
+        self._lifecycle_state = "resumed"
+        if self.tts._is_mobile():
+            try:
+                self.ft_page.on_app_lifecycle_state_change = self._on_lifecycle
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # 动态分页
     # ------------------------------------------------------------------
@@ -512,6 +523,59 @@ class BookViewer(ft.Container):
         self.ft_page.dialog = dialog
         dialog.open = True
         self.ft_page.update()
+
+    # ------------------------------------------------------------------
+    # 安卓 app 生命周期（锁屏/解锁）：修复"锁屏回来 UI 脱节、按键没反应"
+    # ------------------------------------------------------------------
+    def _on_lifecycle(self, e):
+        """监听安卓 app 生命周期：paused(锁屏/退后台) / resumed(解锁/回前台)。
+
+        - paused：默认安全停读并复位朗读状态机（_stop_on_lock=True）。
+          避免后台被系统回收、play_sequential 的 COMPLETED 事件链断裂导致
+          _is_reading 卡死、回来后页面 UI 脱节。
+          若需要"锁屏继续朗读"，将 self._stop_on_lock 设为 False，并务必配套
+          原生 Foreground Service + PARTIAL_WAKE_LOCK + 音频焦点（见回复说明），
+          否则系统仍会在后台暂停音频、挂起连接，回来必然乱。
+        - resumed：强制全量重渲当前页 + page.update()，把最新状态推回前端。
+          锁屏期间积压的 page.update() 可能丢失，造成"后端执行了、前端没刷"
+          ——这正是"翻页/回退键没反应"的表象。解锁后主动补一次即可恢复。
+        """
+        s = str(getattr(e, "state", e)).lower()
+        self._lifecycle_state = s
+        if not self.tts._is_mobile():
+            return
+        if s == "paused":
+            if self._stop_on_lock and self._is_reading:
+                self._tts_stop_event.set()
+                try:
+                    asyncio.get_event_loop().create_task(self._force_stop_reading())
+                except Exception:
+                    pass
+        elif s == "resumed":
+            # 解锁后强制刷新 UI（关键修复：补足锁屏期间丢失的 page.update）
+            try:
+                self._update_page_display(highlight=self._current_sentence_idx)
+            except Exception:
+                pass
+
+    async def _force_stop_reading(self):
+        """彻底复位朗读状态机（锁屏/失焦/异常兜底用）。
+
+        与 _toggle_read 的停止分支等价，但单独封装以便从生命周期回调安全调用
+        （回调在事件循环线程，故用 create_task 投到 loop 执行 async 复位）。
+        """
+        async with self._read_lock:
+            self._tts_stop_event.set()
+            self._is_reading = False
+            if self._restart_timer is not None:
+                try:
+                    self._restart_timer.cancel()
+                except Exception:
+                    pass
+                self._restart_timer = None
+            await self._cancel_read_task()
+        await self._finalize_reading()
+        print("[BookViewer] 生命周期：已强制复位朗读状态机")
 
     async def next_page(self, e):
         if self.current < len(self.pages) - 1:
